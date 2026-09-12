@@ -129,7 +129,7 @@ export interface RunFlags {
   model?: string;
   effort?: string;
   plan?: boolean;
-  autoAccept?: boolean;
+  yolo?: boolean;
   resumeSessionId?: string;
 }
 
@@ -140,7 +140,10 @@ export function buildArgs(flags: RunFlags, text: string): string[] {
   // (e.g. deepseek flash accepts only high/max), and CLI errors on others.
   if (flags.effort) args.push("--effort", flags.effort);
   if (flags.plan) args.push("--plan");
-  if (flags.autoAccept) args.push("--auto-accept");
+  // ponytail: --auto-accept is a no-op for withheld headless tools
+  // (write/shell stay hook-blocked); only --yolo unlocks them.
+  // --tools-all un-withholds the rest.
+  if (flags.yolo) args.push("--yolo", "--tools-all");
   if (flags.resumeSessionId) args.push("--session", flags.resumeSessionId);
   args.push(text);
   return args;

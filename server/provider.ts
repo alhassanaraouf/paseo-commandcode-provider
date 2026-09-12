@@ -376,8 +376,10 @@ function settingValue(
   return typeof value === "string" || typeof value === "boolean" ? value : undefined;
 }
 
-function isAutoAccept(settings: Readonly<Record<string, unknown>>): boolean {
-  const value = settings.autoAccept;
+function isYolo(settings: Readonly<Record<string, unknown>>): boolean {
+  // ponytail: legacy autoAccept values (bool or on/off) map to yolo;
+  // --auto-accept never unlocked headless writes, --yolo does
+  const value = settings.yolo ?? settings.autoAccept;
   return value === true || value === "on";
 }
 
@@ -400,15 +402,15 @@ function configState(session: Session, state?: ConnectionState): ProviderConfigS
     models: modelsView(models),
     modes: MODES.map((mode) => ({ ...mode })),
     thinkingOptions: EFFORTS.map((option) => ({ ...option })),
-    // ponytail: single permission knob rendered as a select so the state
-    // shows beside the label like Mode/Thinking (toggles hide state on desktop).
-    // Accepts legacy boolean true from older sessions.
+    // ponytail: single permission knob as a select so state shows beside
+    // the label. --auto-accept can't unlock headless writes, so this drives
+    // --yolo --tools-all, labeled honestly.
     settings: [
       {
         type: "select",
-        id: "autoAccept",
-        label: "Auto-accept",
-        value: isAutoAccept(settings) ? "on" : "off",
+        id: "yolo",
+        label: "Full auto (yolo, skips all permission checks)",
+        value: isYolo(settings) ? "on" : "off",
         options: [
           { label: "On", value: "on" },
           { label: "Off", value: "off" },
@@ -470,7 +472,7 @@ function flagsFor(session: Session): RunFlags {
     model: session.config.model ?? undefined,
     effort,
     plan: session.config.mode === "plan",
-    autoAccept: isAutoAccept(settings),
+    yolo: isYolo(settings),
     resumeSessionId: session.nativeSessionId ?? undefined,
   };
 }

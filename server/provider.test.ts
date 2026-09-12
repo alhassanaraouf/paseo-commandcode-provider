@@ -38,6 +38,11 @@ describe("commandcode provider", () => {
     ]);
     // ponytail: effort omitted unless chosen — valid levels are per-model
     expect(buildArgs({}, "hello")).not.toContain("--effort");
+    // ponytail: yolo unlocks withheld headless tools (--auto-accept doesn't)
+    expect(buildArgs({ yolo: true }, "hello")).toEqual(
+      expect.arrayContaining(["--yolo", "--tools-all"]),
+    );
+    expect(buildArgs({}, "hello")).not.toContain("--yolo");
   });
 
   it("runs a provider command as a CLI side effect", async () => {
