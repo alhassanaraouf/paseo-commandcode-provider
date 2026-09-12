@@ -1,0 +1,19 @@
+{
+  "name": "commandcode-provider",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Paseo provider plugin for the Command Code coding agent",
+  "author": "Al-Hassan Abdel-Raouf",
+  "license": "MIT",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@getpaseo/plugin": "0.8.0",
+    "@types/node": "^22.9.0",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4",
+    "zod": "^4.4.3"
+  }
+}
