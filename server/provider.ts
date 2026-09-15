@@ -19,6 +19,7 @@ import {
 import { buildArgs, parseLine, type RunFlags } from "./commandcode.js";
 import { commandArgv, COMMANDS, findCommand } from "./commands.js";
 import { FALLBACK_DEFAULT, FALLBACK_MODELS, parseListModels, type ModelInfo } from "./models.js";
+import { parseSkillsList, type SkillInfo } from "./skills.js";
 import { readSettingsDocument } from "./settings.js";
 import { CLI_DEFAULTS, cliSettings } from "../shared/settings.js";
 
@@ -105,10 +106,13 @@ interface ConnectionState {
   spawn: SpawnFn;
   exec: ExecFn;
   listModels: () => Promise<string>;
+  listSkills: () => Promise<string>;
   models: ModelInfo[];
   defaultModel: string;
   modelsFetchedAt: number;
   cache: ModelsCache;
+  skills: Map<string, SkillInfo>;
+  skillsFetchedAt: number;
 }
 
 const MODELS_TTL_MS = 60 * 60 * 1000;
@@ -117,6 +121,11 @@ const execFileAsync = promisify(nodeExecFile);
 
 async function runListModels(command: string): Promise<string> {
   const { stdout } = await execFileAsync(command, ["--list-models"], { timeout: 30_000 });
+  return stdout;
+}
+
+async function runListSkills(command: string): Promise<string> {
+  const { stdout } = await execFileAsync(command, ["skills", "list"], { timeout: 30_000 });
   return stdout;
 }
 
@@ -148,6 +157,7 @@ export function createCommandcodeProvider(options?: {
   spawn?: SpawnFn;
   exec?: ExecFn;
   listModels?: () => Promise<string>;
+  listSkills?: () => Promise<string>;
   modelsCache?: ModelsCache;
 }): ProviderRegistration {
   return {
@@ -173,6 +183,7 @@ export function createCommandcodeProvider(options?: {
         spawn: options?.spawn ?? defaultSpawn,
         exec: options?.exec ?? defaultExec,
         listModels: options?.listModels ?? (() => runListModels(command)),
+        listSkills: options?.listSkills ?? (() => runListSkills(command)),
         cache: options?.modelsCache ?? createModelsCache(),
       });
     },
@@ -181,7 +192,7 @@ export function createCommandcodeProvider(options?: {
 
 function createConnection(
   capabilities: readonly string[],
-  options: { command: string; spawn: SpawnFn; exec: ExecFn; listModels: () => Promise<string>; cache: ModelsCache },
+  options: { command: string; spawn: SpawnFn; exec: ExecFn; listModels: () => Promise<string>; listSkills: () => Promise<string>; cache: ModelsCache },
 ): ProviderConnection {
   const listeners = new Set<(event: ProviderEvent) => void>();
   const sessions = new Map<string, Session>();
@@ -196,10 +207,13 @@ function createConnection(
     spawn: options.spawn,
     exec: options.exec,
     listModels: options.listModels,
+    listSkills: options.listSkills,
     models: options.cache.models,
     defaultModel: options.cache.defaultModel,
     modelsFetchedAt: 0,
     cache: options.cache,
+    skills: new Map(),
+    skillsFetchedAt: 0,
   };
 
   return {
@@ -265,6 +279,26 @@ async function refreshModels(state: ConnectionState): Promise<boolean> {
   return false;
 }
 
+async function refreshSkills(state: ConnectionState): Promise<boolean> {
+  if (Date.now() - state.skillsFetchedAt < MODELS_TTL_MS && state.skillsFetchedAt > 0) return false;
+  try {
+    const parsed = parseSkillsList(await state.listSkills());
+    const next = new Map(parsed.map((skill) => [skill.name, skill] as const));
+    const changed =
+      next.size !== state.skills.size ||
+      [...next.keys()].some((name) => {
+        const prev = state.skills.get(name);
+        const cur = next.get(name);
+        return prev?.description !== cur?.description;
+      });
+    state.skills = next;
+    state.skillsFetchedAt = Date.now();
+    return changed;
+  } catch {
+    return false;
+  }
+}
+
 // ponytail: shared Build/Plan catalog+config modes, keep identical in both places
 const MODES = [
   { id: "build", label: "Build" },
@@ -275,12 +309,21 @@ function modelsView(models: ModelInfo[]) {
   return models.map((model) => ({ id: model.id, label: model.label, ...(model.description ? { description: model.description } : {}) }));
 }
 
-function commandsView() {
-  return COMMANDS.map((command) => ({
+function commandsView(state?: ConnectionState) {
+  const base = COMMANDS.map((command) => ({
     name: command.name,
     description: command.description,
     ...(command.argumentHint ? { argumentHint: command.argumentHint } : {}),
   }));
+  if (!state) return base;
+  for (const skill of state.skills.values()) {
+    if (base.some((command) => command.name === skill.name)) continue;
+    base.push({
+      name: skill.name,
+      description: skill.description ?? `Invoke the ${skill.name} skill`,
+    });
+  }
+  return base;
 }
 
 function catalogState(state: ConnectionState) {
@@ -361,10 +404,14 @@ function openSession(
   // ponytail: emit config+commands synchronously so the composer mounts complete;
   // re-emit only when the background refresh actually changed the model list
   state.emit({ type: "session.config", sessionId: input.sessionId, config: configState(session, state) });
-  state.emit({ type: "session.commands", sessionId: input.sessionId, commands: commandsView() });
+  state.emit({ type: "session.commands", sessionId: input.sessionId, commands: commandsView(state) });
   void refreshModels(state).then((changed) => {
     if (!changed) return;
     state.emit({ type: "session.config", sessionId: input.sessionId, config: configState(session, state) });
+  });
+  void refreshSkills(state).then((changed) => {
+    if (!changed) return;
+    state.emit({ type: "session.commands", sessionId: input.sessionId, commands: commandsView(state) });
   });
   if (input.history === "replay") {
     for (const item of session.transcript) {
@@ -462,7 +509,7 @@ function configureSession(
   state.emit({
     type: "session.commands",
     sessionId: input.sessionId,
-    commands: commandsView(),
+    commands: commandsView(state),
   });
   state.emit({ type: "request.completed", requestId: input.requestId });
 }
@@ -511,7 +558,7 @@ function promptSession(
     return;
   }
   if (input.prompt.input.type === "command") {
-    runCommand(input.sessionId, session, input.prompt.clientMessageId, input.prompt.input.name, input.prompt.input.arguments, state);
+    runSlashCommand(input.sessionId, session, input.prompt.clientMessageId, input.prompt.input.name, input.prompt.input.arguments, state);
     return;
   }
   const { text, hasImage } = promptText(input.prompt.input.content);
@@ -523,6 +570,63 @@ function promptSession(
     fail("Empty prompt");
     return;
   }
+  runAgentTurn(input.sessionId, session, input.prompt.clientMessageId, text, state);
+}
+
+function runSlashCommand(
+  sessionId: string,
+  session: Session,
+  clientMessageId: string,
+  name: string,
+  args: string,
+  state: ConnectionState,
+): void {
+  if (findCommand(name)) {
+    runCommand(sessionId, session, clientMessageId, name, args, state);
+    return;
+  }
+  if (state.skills.has(name)) {
+    // ponytail: installed skills are first-class slash commands in the CLI,
+    // so run them as an agent turn: `commandcode -p "/skill args"`.
+    const text = args.trim() ? `/${name} ${args.trim()}` : `/${name}`;
+    runAgentTurn(sessionId, session, clientMessageId, text, state);
+    return;
+  }
+  // ponytail: skills load in the background at session.open, so a fast
+  // typist can beat the refresh — retry once before reporting unknown.
+  void refreshSkills(state).then((changed) => {
+    if (changed) {
+      state.emit({ type: "session.commands", sessionId, commands: commandsView(state) });
+    }
+    if (state.skills.has(name)) {
+      const text = args.trim() ? `/${name} ${args.trim()}` : `/${name}`;
+      runAgentTurn(sessionId, session, clientMessageId, text, state);
+      return;
+    }
+    state.emit({
+      type: "session.prompt_result",
+      sessionId,
+      clientMessageId,
+      result: { type: "failed", error: { message: `Unknown command: /${name}` } },
+    });
+  });
+}
+
+function runAgentTurn(
+  sessionId: string,
+  session: Session,
+  clientMessageId: string,
+  text: string,
+  state: ConnectionState,
+): void {
+  const fail = (message: string) => {
+    state.emit({
+      type: "session.prompt_result",
+      sessionId,
+      clientMessageId,
+      result: { type: "failed", error: { message } },
+    });
+  };
   if (session.active) {
     fail("A turn is already running");
     return;
@@ -531,21 +635,21 @@ function promptSession(
   const turnId = randomUUID();
   const push = (item: ProviderTimelineItem) => {
     session.transcript.push(item);
-    state.emit({ type: "timeline.item", sessionId: input.sessionId, item });
+    state.emit({ type: "timeline.item", sessionId, item });
   };
   push({
     type: "user_message",
     id: `user-${turnId}`,
     text,
-    clientMessageId: input.prompt.clientMessageId,
+    clientMessageId,
   });
   state.emit({
     type: "session.prompt_result",
-    sessionId: input.sessionId,
-    clientMessageId: input.prompt.clientMessageId,
+    sessionId,
+    clientMessageId,
     result: { type: "turn", turnId },
   });
-  state.emit({ type: "session.turn", sessionId: input.sessionId, turnId, state: "started" });
+  state.emit({ type: "session.turn", sessionId, turnId, state: "started" });
 
   const env: Record<string, string> = {};
   for (const [key, value] of Object.entries(process.env)) {
@@ -561,7 +665,7 @@ function promptSession(
   } catch (error) {
     state.emit({
       type: "session.turn",
-      sessionId: input.sessionId,
+      sessionId,
       turnId,
       state: "failed",
       error: { message: error instanceof Error ? error.message : String(error) },
@@ -583,7 +687,7 @@ function promptSession(
     if (finished) return;
     finished = true;
     session.active = null;
-    state.emit({ type: "session.turn", sessionId: input.sessionId, turnId, state: terminal, ...(error ? { error: { message: error } } : {}) });
+    state.emit({ type: "session.turn", sessionId, turnId, state: terminal, ...(error ? { error: { message: error } } : {}) });
   };
 
   let buffer = "";
@@ -599,7 +703,7 @@ function promptSession(
           session.nativeSessionId = parsed.sessionId;
           state.emit({
             type: "session.persistence",
-            sessionId: input.sessionId,
+            sessionId,
             persistence: { version: 1, data: { sessionId: parsed.sessionId } },
           });
           break;
@@ -670,7 +774,7 @@ function promptSession(
             session.nativeSessionId = parsed.sessionId;
             state.emit({
               type: "session.persistence",
-              sessionId: input.sessionId,
+              sessionId,
               persistence: { version: 1, data: { sessionId: parsed.sessionId } },
             });
           }
@@ -679,7 +783,7 @@ function promptSession(
             push({ type: "assistant_message", id: `assistant-${turnId}`, text: assistantText });
           }
           if (usage && (usage.inputTokens !== undefined || usage.outputTokens !== undefined)) {
-            state.emit({ type: "session.usage", sessionId: input.sessionId, turnId, usage });
+            state.emit({ type: "session.usage", sessionId, turnId, usage });
           }
           finish("completed");
           break;

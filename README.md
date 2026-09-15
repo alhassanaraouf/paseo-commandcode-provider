@@ -37,6 +37,7 @@ Then create an agent with the **Command Code** provider.
   - `/taste-list`, `/taste-learn [path|owner/repo]`
   - `/skills-list`, `/skills-add <owner/repo>`
   - `/mods-list`, `/mods-add <source>`
+- **Skills** — installed skills (`commandcode skills list`) appear in the composer `/` menu and run as agent turns (`/paseo ...`), like other providers.
 - Interrupt kills the running CLI process.
 
 ## Known issues
