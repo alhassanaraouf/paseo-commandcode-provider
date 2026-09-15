@@ -122,6 +122,26 @@ describe("commandcode provider", () => {
     await connection.close();
   });
 
+  it("shows an empty model list when the CLI refresh fails", async () => {
+    const connection = await createCommandcodeProvider({
+      spawn: () => {
+        throw new Error("no spawn in catalog test");
+      },
+      listModels: () => Promise.reject(new Error("cli exploded")),
+    }).connect({ versions: [1], capabilities: ["prompt.message"] });
+    const events: ProviderEvent[] = [];
+    connection.onEvent((event) => events.push(event));
+    await connection.send({ type: "catalog", requestId: "c1" });
+    await tick();
+    await tick();
+    const catalog = events.find(
+      (event): event is Extract<ProviderEvent, { type: "catalog" }> => event.type === "catalog",
+    );
+    expect(catalog?.catalog.models).toEqual([]);
+    expect(catalog?.catalog.defaultModel).toBeUndefined();
+    await connection.close();
+  });
+
   it("runs a prompt lifecycle against a fake commandcode", async () => {
     let spawnedArgs: string[] = [];
     const stdout = stream();

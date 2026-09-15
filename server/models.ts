@@ -11,21 +11,6 @@ export interface ModelList {
   defaultId?: string;
 }
 
-export const FALLBACK_DEFAULT = "deepseek/deepseek-v4-flash";
-
-// ponytail: used only when `commandcode --list-models` fails; refresh if stale
-export const FALLBACK_MODELS: ModelInfo[] = [
-  { id: "deepseek/deepseek-v4-flash", label: "deepseek-v4-flash" },
-  { id: "deepseek/deepseek-v4-pro", label: "deepseek-v4-pro" },
-  { id: "moonshotai/kimi-k2.5", label: "kimi-k2.5" },
-  { id: "claude-sonnet-5", label: "claude-sonnet-5" },
-  { id: "claude-opus-5", label: "claude-opus-5" },
-  { id: "gpt-5.5", label: "gpt-5.5" },
-  { id: "google/gemini-3.5-flash", label: "gemini-3.5-flash" },
-  { id: "meta/muse-spark-1.3", label: "muse-spark-1.3" },
-  { id: "xai/grok-4.5", label: "grok-4.5" },
-];
-
 const SKIP_PREFIXES = ["Available", "Pass", "Docs:"];
 
 export function parseListModels(text: string): ModelList {
