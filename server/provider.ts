@@ -161,7 +161,9 @@ export function createCommandcodeProvider(options?: {
         request.capabilities,
         CAPABILITIES as unknown as readonly ProviderCapability[],
       );
-      const command = options?.command ?? "commandcode";
+      // ponytail: "cmd" is the Windows shell, so the npm package publishes "cmdc"
+      // as its short alias there; "commandcode" is the cross-platform full name.
+      const command = options?.command ?? (process.platform === "win32" ? "cmdc" : "commandcode");
       return createConnection(capabilities, {
         command,
         spawn: options?.spawn ?? defaultSpawn,
@@ -383,6 +385,12 @@ function isYolo(settings: Readonly<Record<string, unknown>>): boolean {
   return value === true || value === "on";
 }
 
+// ponytail: lets a user point at a custom binary (path, cmdc, a wrapper
+// script) via the agent's standard env vars, no dedicated settings UI needed
+function commandFor(session: Session, state: ConnectionState): string {
+  return session.config.env.COMMANDCODE_CLI_COMMAND?.trim() || state.command;
+}
+
 function effortOf(session: Session): string | undefined {
   // ponytail: effort lives only in the native Thinking pill (thinkingOptions);
   // the custom select was a duplicate, so settings are ignored here
@@ -542,7 +550,7 @@ function promptSession(
   Object.assign(env, session.config.env);
   let proc: Proc;
   try {
-    proc = state.spawn(state.command, buildArgs(flagsFor(session), text), {
+    proc = state.spawn(commandFor(session, state), buildArgs(flagsFor(session), text), {
       cwd: session.config.cwd,
       env,
     });
@@ -728,7 +736,7 @@ function runCommand(
   }
   Object.assign(env, session.config.env);
   void state
-    .exec(state.command, argv, { cwd: session.config.cwd, env, timeoutMs: 120_000 })
+    .exec(commandFor(session, state), argv, { cwd: session.config.cwd, env, timeoutMs: 120_000 })
     .then(({ stdout, stderr }) => {
       const output = [stdout.trim(), stderr.trim()].filter(Boolean).join("\n");
       if (def.showOutput) {
