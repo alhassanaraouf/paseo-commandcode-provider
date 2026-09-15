@@ -18,7 +18,7 @@ import {
 } from "@getpaseo/plugin/server/provider";
 import { buildArgs, parseLine, type RunFlags } from "./commandcode.js";
 import { commandArgv, COMMANDS, findCommand } from "./commands.js";
-import { FALLBACK_DEFAULT, FALLBACK_MODELS, parseListModels, type ModelInfo } from "./models.js";
+import { parseListModels, type ModelInfo } from "./models.js";
 import { readSettingsDocument } from "./settings.js";
 import { CLI_DEFAULTS, cliSettings } from "../shared/settings.js";
 
@@ -28,8 +28,6 @@ const CAPABILITIES = [
   "session.configure",
   "session.persistence",
 ] as const;
-
-const DEFAULT_MODEL = FALLBACK_DEFAULT;
 
 // ponytail: effort levels are per-model (e.g. deepseek flash takes only high/max),
 // so no default is advertised and --effort is omitted unless explicitly chosen
@@ -94,7 +92,7 @@ interface Session {
 
 interface ModelsCache {
   models: ModelInfo[];
-  defaultModel: string;
+  defaultModel?: string;
   fetchedAt: number;
 }
 
@@ -106,7 +104,7 @@ interface ConnectionState {
   exec: ExecFn;
   listModels: () => Promise<string>;
   models: ModelInfo[];
-  defaultModel: string;
+  defaultModel?: string;
   modelsFetchedAt: number;
   cache: ModelsCache;
 }
@@ -233,9 +231,9 @@ function createConnection(
 }
 
 // ponytail: per-provider cache so every connection/open reuses the last good
-// list without re-running the ~4s CLI call; falls back to the static list
+// list without re-running the ~4s CLI call; starts empty until refreshed
 function createModelsCache(): ModelsCache {
-  return { models: FALLBACK_MODELS, defaultModel: DEFAULT_MODEL, fetchedAt: 0 };
+  return { models: [], defaultModel: undefined, fetchedAt: 0 };
 }
 
 async function refreshModels(state: ConnectionState): Promise<boolean> {
@@ -260,7 +258,7 @@ async function refreshModels(state: ConnectionState): Promise<boolean> {
       return true;
     }
   } catch {
-    // keep fallback / cached list
+    // keep the last good list, or the empty list if never refreshed
   }
   return false;
 }
@@ -288,7 +286,7 @@ function catalogState(state: ConnectionState) {
     models: modelsView(state.models),
     modes: MODES.map((mode) => ({ ...mode })),
     thinkingOptions: EFFORTS.map((effort) => ({ ...effort })),
-    defaultModel: state.defaultModel,
+    ...(state.defaultModel ? { defaultModel: state.defaultModel } : {}),
     defaultMode: "build",
   };
 }
@@ -405,10 +403,10 @@ function effortOf(session: Session): string | undefined {
 function configState(session: Session, state?: ConnectionState): ProviderConfigState {
   const settings = session.config.settings as Record<string, unknown>;
   const effort = effortOf(session);
-  const models = state?.models ?? FALLBACK_MODELS;
-  const defaultModel = state?.defaultModel ?? DEFAULT_MODEL;
+  const models = state?.models ?? [];
+  const defaultModel = state?.defaultModel ?? session.config.model;
   return {
-    model: session.config.model ?? defaultModel,
+    ...(session.config.model ?? defaultModel ? { model: session.config.model ?? defaultModel } : {}),
     mode: session.config.mode ?? "build",
     thinkingOption: effort,
     models: modelsView(models),
