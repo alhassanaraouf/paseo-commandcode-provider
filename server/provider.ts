@@ -19,6 +19,8 @@ import {
 import { buildArgs, parseLine, type RunFlags } from "./commandcode.js";
 import { commandArgv, COMMANDS, findCommand } from "./commands.js";
 import { FALLBACK_DEFAULT, FALLBACK_MODELS, parseListModels, type ModelInfo } from "./models.js";
+import { readSettingsDocument } from "./settings.js";
+import { CLI_DEFAULTS, cliSettings } from "../shared/settings.js";
 
 const CAPABILITIES = [
   "prompt.message",
@@ -163,7 +165,9 @@ export function createCommandcodeProvider(options?: {
       );
       // ponytail: "cmd" is the Windows shell, so the npm package publishes "cmdc"
       // as its short alias there; "commandcode" is the cross-platform full name.
-      const command = options?.command ?? (process.platform === "win32" ? "cmdc" : "commandcode");
+      const platformDefault = process.platform === "win32" ? "cmdc" : "commandcode";
+      const configured = readSettingsDocument(cliSettings, CLI_DEFAULTS).command.trim();
+      const command = options?.command ?? (configured || platformDefault);
       return createConnection(capabilities, {
         command,
         spawn: options?.spawn ?? defaultSpawn,
