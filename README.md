@@ -28,6 +28,7 @@ Then create an agent with the **Command Code** provider.
 ## What works
 
 - **Messages** — prompts run headless (`commandcode -p --output-format json`), streamed into the timeline (text, thinking, tool calls, usage).
+- **Tasks** — `task_create` / `task_update` / `task_list` / `task_get` maintain a session task list shown in the Tasks pill (`todo` timeline item, like the opencode provider).
 - **Models** — full live list from `commandcode --list-models` (1h cache, fallback on failure).
 - **Modes** — Build / Plan (`--plan`).
 - **Effort** — optional per-model selector (low/medium/high/max); omitted by default because valid levels differ per model.

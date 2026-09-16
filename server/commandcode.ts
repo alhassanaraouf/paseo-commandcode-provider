@@ -125,6 +125,38 @@ export function parseLine(line: string): CommandcodeLine {
   }
 }
 
+export interface TaskItem {
+  id: string;
+  text: string;
+  status: "pending" | "in_progress" | "completed";
+  activeForm?: string;
+}
+
+// ponytail: task_list prints "#1 [in_progress] Write docs" per line
+export function parseTaskList(text: string): TaskItem[] {
+  const items: TaskItem[] = [];
+  for (const line of text.split("\n")) {
+    const match = /^#([A-Za-z0-9_-]+)\s+\[(pending|in_progress|completed)\]\s+(.+?)\s*$/.exec(line.trim());
+    if (match) items.push({ id: match[1], text: match[3], status: match[2] as TaskItem["status"] });
+  }
+  return items;
+}
+
+// ponytail: task_get prints "Task #1: title" + "Status: in_progress"
+export function parseTaskGet(text: string): TaskItem | null {
+  const id = /^Task #([A-Za-z0-9_-]+):\s*(.+?)\s*$/m.exec(text)?.[1];
+  const title = /^Task #[A-Za-z0-9_-]+:\s*(.+?)\s*$/m.exec(text)?.[1];
+  const status = /^Status:\s*(\S+)\s*$/m.exec(text)?.[1];
+  if (!id || !title) return null;
+  if (status !== "pending" && status !== "in_progress" && status !== "completed") return null;
+  return { id, text: title, status };
+}
+
+// ponytail: "Task #1 created: ..." / "Updated task #1: ..." carry the numeric id
+export function parseTaskId(text: string): string | null {
+  return /(?:Task|task) #([A-Za-z0-9_-]+)/.exec(text)?.[1] ?? null;
+}
+
 export interface RunFlags {
   model?: string;
   effort?: string;

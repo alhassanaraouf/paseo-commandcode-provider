@@ -16,7 +16,7 @@ import {
   type ProviderTimelineItem,
   type ProviderToolCallDetail,
 } from "@getpaseo/plugin/server/provider";
-import { buildArgs, parseLine, type RunFlags } from "./commandcode.js";
+import { buildArgs, parseLine, parseTaskGet, parseTaskId, parseTaskList, type RunFlags } from "./commandcode.js";
 import { commandArgv, COMMANDS, findCommand } from "./commands.js";
 import { parseListModels, type ModelInfo } from "./models.js";
 import { parseSkillsList, type SkillInfo } from "./skills.js";
@@ -89,6 +89,7 @@ interface Session {
   nativeSessionId: string | null;
   transcript: ProviderTimelineItem[];
   active: { turnId: string; proc: Proc } | null;
+  tasks: Map<string, { text: string; status: "pending" | "in_progress" | "completed"; activeForm?: string }>;
 }
 
 interface ModelsCache {
@@ -385,6 +386,7 @@ function openSession(
     nativeSessionId: resumeId(input.persistence),
     transcript: [],
     active: null,
+    tasks: new Map(),
   };
   state.sessions.set(input.sessionId, session);
   state.emit({
@@ -635,6 +637,26 @@ function runAgentTurn(
     session.transcript.push(item);
     state.emit({ type: "timeline.item", sessionId, item });
   };
+  // ponytail: the Tasks pill renders timeline todo items, same as opencode's
+  // provider — task_* tool calls maintain a session task list emitted here
+  const emitTasks = () => {
+    if (session.tasks.size === 0) return;
+    push({
+      type: "todo",
+      id: "tasks",
+      items: [...session.tasks.entries()].map(([id, task]) => ({
+        id,
+        text: task.text,
+        completed: task.status === "completed",
+        status: task.status,
+        ...(task.activeForm ? { activeForm: task.activeForm } : {}),
+      })),
+    });
+  };
+  const taskStatusOf = (value: unknown): "pending" | "in_progress" | "completed" | "deleted" | undefined =>
+    value === "pending" || value === "in_progress" || value === "completed" || value === "deleted"
+      ? value
+      : undefined;
   push({
     type: "user_message",
     id: `user-${turnId}`,
@@ -744,6 +766,27 @@ function runAgentTurn(
             status: "running",
             error: null,
           });
+          // ponytail: optimistic pill update so status flips show immediately
+          if (parsed.kind === "tool_queued" && parsed.toolName === "task_update") {
+            const id = String(parsed.input.taskId ?? "");
+            const task = id ? session.tasks.get(id) : undefined;
+            const status = taskStatusOf(parsed.input.status);
+            const subject = typeof parsed.input.subject === "string" ? parsed.input.subject : undefined;
+            if (id && (task || subject)) {
+              if (status === "deleted") session.tasks.delete(id);
+              else {
+                session.tasks.set(id, {
+                  text: subject ?? task?.text ?? id,
+                  status: status ?? task?.status ?? "pending",
+                  activeForm:
+                    typeof parsed.input.activeForm === "string"
+                      ? parsed.input.activeForm
+                      : task?.activeForm,
+                });
+              }
+              emitTasks();
+            }
+          }
           break;
         }
         case "tool_completed": {
@@ -762,6 +805,54 @@ function runAgentTurn(
             status: "completed",
             error: null,
           });
+          if (existing.name === "task_list") {
+            const items = parseTaskList(parsed.resultText);
+            if (items.length > 0) {
+              session.tasks = new Map(
+                items.map((item) => [item.id, { text: item.text, status: item.status }]),
+              );
+              emitTasks();
+            }
+          } else if (existing.name === "task_get") {
+            const item = parseTaskGet(parsed.resultText);
+            if (item) {
+              const prev = session.tasks.get(item.id);
+              session.tasks.set(item.id, { text: item.text, status: item.status, activeForm: prev?.activeForm });
+              emitTasks();
+            }
+          } else if (existing.name === "task_create" || existing.name === "task_update") {
+            const input = existing.input as Record<string, unknown>;
+            const id = String(input.taskId ?? parseTaskId(parsed.resultText) ?? "");
+            const status = taskStatusOf(input.status);
+            const subject = (input.subject ?? input.description) as unknown;
+            const title =
+              typeof subject === "string" && subject
+                ? subject
+                : /^Task #\S+ created:\s*(.+?)\s*$/.exec(parsed.resultText)?.[1];
+            if (existing.name === "task_create" && id) {
+              session.tasks.set(id, {
+                text: title || `Task ${id}`,
+                status: status && status !== "deleted" ? status : "pending",
+                ...(typeof input.activeForm === "string" ? { activeForm: input.activeForm } : {}),
+              });
+              emitTasks();
+            } else if (existing.name === "task_update" && id) {
+              if (status === "deleted") {
+                if (session.tasks.delete(id)) emitTasks();
+              } else {
+                const prev = session.tasks.get(id);
+                if (prev || title || status) {
+                  session.tasks.set(id, {
+                    text: title ?? prev?.text ?? `Task ${id}`,
+                    status: status ?? prev?.status ?? "pending",
+                    activeForm:
+                      typeof input.activeForm === "string" ? input.activeForm : prev?.activeForm,
+                  });
+                  emitTasks();
+                }
+              }
+            }
+          }
           break;
         }
         case "turn_end":
