@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { buildArgs, parseLine } from "./commandcode.js";
 import { createCommandcodeProvider, type Proc, type SpawnFn } from "./provider.js";
+import { parseSkillsList } from "./skills.js";
 import type { ProviderEvent } from "@getpaseo/plugin/server/provider";
 
 function stream() {
@@ -56,6 +57,7 @@ describe("commandcode provider", () => {
         return Promise.resolve({ stdout: "no packages", stderr: "" });
       },
       listModels: () => Promise.resolve("fallback-model  fallback (default)"),
+      listSkills: () => Promise.resolve(""),
     }).connect({
       versions: [1],
       capabilities: ["prompt.message", "prompt.command", "session.configure", "session.persistence"],
@@ -94,6 +96,26 @@ describe("commandcode provider", () => {
     );
     expect(events).toContainEqual(expect.objectContaining({ type: "session.notice" }));
     await connection.close();
+  });
+
+  it("parses `skills list` output", () => {
+    const output = [
+      "",
+      " Skills  9 installed",
+      "",
+      "Global (9)",
+      "  better-ui · Polishes and improves the UI in your project. Covers conc...",
+      "  paseo · Paseo reference for managing projects, workspaces, worksp...",
+      "",
+      "Bundled (6)",
+      "  config · Inspect or change validated Command Code settings. Use wh...",
+    ].join("\n");
+    expect(parseSkillsList(output)).toEqual([
+      { name: "better-ui", description: "Polishes and improves the UI in your project. Covers conc..." },
+      { name: "paseo", description: "Paseo reference for managing projects, workspaces, worksp..." },
+      { name: "config", description: "Inspect or change validated Command Code settings. Use wh..." },
+    ]);
+    expect(parseSkillsList("")).toEqual([]);
   });
 
   it("lists live models from the CLI", async () => {
@@ -220,6 +242,61 @@ describe("commandcode provider", () => {
         event.type === "session.turn" && event.state === "completed",
     );
     expect(turnDone).toBeDefined();
+    await connection.close();
+  });
+
+  it("advertises installed skills as slash commands and runs them as turns", async () => {
+    let spawnedArgs: string[] = [];
+    const stdout = stream();
+    const stderr = stream();
+    const procEvents = stream();
+    const fakeSpawn: SpawnFn = (_cmd, args) => {
+      spawnedArgs = args;
+      return {
+        stdout: stdout as unknown as Proc["stdout"],
+        stderr: stderr as unknown as Proc["stderr"],
+        on: procEvents.on,
+        kill: () => {},
+      } as Proc;
+    };
+    const connection = await createCommandcodeProvider({
+      spawn: fakeSpawn,
+      listModels: () => Promise.resolve("fallback-model  fallback (default)"),
+      listSkills: () =>
+        Promise.resolve(["Global (2)", "  paseo · Paseo reference", "  better-ui · Polish UI"].join("\n")),
+    }).connect({
+      versions: [1],
+      capabilities: ["prompt.message", "prompt.command", "session.configure", "session.persistence"],
+    });
+    const events: ProviderEvent[] = [];
+    connection.onEvent((event) => events.push(event));
+    await connection.send({
+      type: "session.open",
+      requestId: "o1",
+      sessionId: "s1",
+      config: { cwd: "/tmp", env: {}, mcpServers: {}, settings: {}, persist: false },
+      history: "skip",
+    });
+    await tick();
+    await tick();
+    const commands = events.filter(
+      (event): event is Extract<ProviderEvent, { type: "session.commands" }> => event.type === "session.commands",
+    );
+    const latest = commands.at(-1);
+    expect(latest?.commands.map((command) => command.name)).toEqual(
+      expect.arrayContaining(["status", "paseo", "better-ui"]),
+    );
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: {
+        clientMessageId: "c1",
+        delivery: "auto",
+        input: { type: "command", name: "paseo", arguments: "list projects" },
+      },
+    });
+    await tick();
+    expect(spawnedArgs.at(-1)).toBe("/paseo list projects");
     await connection.close();
   });
 });
