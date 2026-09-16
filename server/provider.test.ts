@@ -2,7 +2,7 @@ import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { buildArgs, parseLine } from "./commandcode.js";
+import { buildArgs, parseLine, parseTaskGet, parseTaskId, parseTaskList } from "./commandcode.js";
 import { createCommandcodeProvider, type Proc, type SpawnFn } from "./provider.js";
 import { listNativeSessions, readNativeTranscript } from "./sessions.js";
 import { parseSkillsList } from "./skills.js";
@@ -246,6 +246,83 @@ describe("commandcode provider", () => {
         event.type === "session.turn" && event.state === "completed",
     );
     expect(turnDone).toBeDefined();
+    await connection.close();
+  });
+
+  it("parses task payloads for the Tasks pill", () => {
+    expect(parseTaskList("#1 [pending] Write docs\n#2 [in_progress] Fix bug\n\n0/2 completed")).toEqual([
+      { id: "1", text: "Write docs", status: "pending" },
+      { id: "2", text: "Fix bug", status: "in_progress" },
+    ]);
+    expect(parseTaskGet("Task #1: Write docs\nStatus: in_progress\nDescription: docs")).toEqual({
+      id: "1",
+      text: "Write docs",
+      status: "in_progress",
+    });
+    expect(parseTaskId("Task #3 created: Write tests")).toBe("3");
+    expect(parseTaskId("Updated task #1: status")).toBe("1");
+  });
+
+  it("emits todo timeline items for task_* tool calls", async () => {
+    const stdout = stream();
+    const stderr = stream();
+    const procEvents = stream();
+    const fakeSpawn: SpawnFn = () => {
+      return {
+        stdout: stdout as unknown as Proc["stdout"],
+        stderr: stderr as unknown as Proc["stderr"],
+        on: procEvents.on,
+        kill: () => {},
+      } as Proc;
+    };
+    const connection = await createCommandcodeProvider({
+      spawn: fakeSpawn,
+      listModels: () => Promise.resolve("fallback-model  fallback (default)"),
+    }).connect({
+      versions: [1],
+      capabilities: ["prompt.message", "session.configure", "session.persistence"],
+    });
+    const events: ProviderEvent[] = [];
+    connection.onEvent((event) => events.push(event));
+    await connection.send({
+      type: "session.open",
+      requestId: "o1",
+      sessionId: "s1",
+      config: { cwd: "/tmp", env: {}, mcpServers: {}, settings: {}, persist: false },
+      history: "skip",
+    });
+    await tick();
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: {
+        clientMessageId: "m1",
+        delivery: "auto",
+        input: { type: "message", content: [{ type: "text", text: "hello" }] },
+      },
+    });
+    await tick();
+    stdout.emit(
+      "data",
+      '{"type":"event","event":{"type":"run_start","sessionId":"native-1"}}\n' +
+        '{"type":"event","event":{"type":"tool_queued","toolCallId":"c1","toolName":"task_create","input":{"subject":"Write docs"}}}\n' +
+        '{"type":"event","event":{"type":"tool_completed","toolCallId":"c1","toolName":"task_create","result":[{"type":"text","text":"Task #1 created: Write docs"}]}}\n' +
+        '{"type":"event","event":{"type":"tool_queued","toolCallId":"c2","toolName":"task_update","input":{"taskId":"1","status":"in_progress"}}}\n' +
+        '{"type":"event","event":{"type":"tool_completed","toolCallId":"c2","toolName":"task_update","result":[{"type":"text","text":"Updated task #1: status\\nStatus: pending -> in_progress"}]}}\n' +
+        '{"type":"event","event":{"type":"tool_queued","toolCallId":"c3","toolName":"task_list","input":{}}}\n' +
+        '{"type":"event","event":{"type":"tool_completed","toolCallId":"c3","toolName":"task_list","result":[{"type":"text","text":"#1 [in_progress] Write docs\\n#2 [pending] Fix bug\\n\\n0/2 completed"}]}}\n',
+    );
+    await tick();
+    const todos = events.filter(
+      (event): event is Extract<ProviderEvent, { type: "timeline.item" }> =>
+        event.type === "timeline.item" && event.item.type === "todo",
+    );
+    expect(todos.length).toBeGreaterThan(0);
+    const latest = todos.at(-1);
+    expect(latest?.item.type === "todo" ? latest.item.items : undefined).toEqual([
+      { id: "1", text: "Write docs", completed: false, status: "in_progress" },
+      { id: "2", text: "Fix bug", completed: false, status: "pending" },
+    ]);
     await connection.close();
   });
 
