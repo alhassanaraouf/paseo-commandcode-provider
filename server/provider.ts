@@ -14,11 +14,11 @@ import {
   type ProviderRegistration,
   type ProviderSessionConfig,
   type ProviderTimelineItem,
-  type ProviderToolCallDetail,
 } from "@getpaseo/plugin/server/provider";
 import { buildArgs, parseLine, type RunFlags } from "./commandcode.js";
 import { commandArgv, COMMANDS, findCommand } from "./commands.js";
 import { parseListModels, type ModelInfo } from "./models.js";
+import { listNativeSessions, readNativeTranscript, toolDetail } from "./sessions.js";
 import { parseSkillsList, type SkillInfo } from "./skills.js";
 import { readSettingsDocument } from "./settings.js";
 import { CLI_DEFAULTS, cliSettings } from "../shared/settings.js";
@@ -27,6 +27,7 @@ const CAPABILITIES = [
   "prompt.message",
   "prompt.command",
   "session.configure",
+  "session.list",
   "session.persistence",
 ] as const;
 
@@ -341,6 +342,13 @@ function dispatch(input: ProviderInput, state: ConnectionState): void {
         state.emit({ type: "catalog", requestId: input.requestId, catalog: catalogState(state) });
       });
       return;
+    case "sessions":
+      state.emit({
+        type: "sessions",
+        requestId: input.requestId,
+        sessions: listNativeSessions({ query: input.query, cwd: input.cwd, limit: input.limit }),
+      });
+      return;
     case "session.open":
       openSession(input, state);
       return;
@@ -412,6 +420,11 @@ function openSession(
     state.emit({ type: "session.commands", sessionId: input.sessionId, commands: commandsView(state) });
   });
   if (input.history === "replay") {
+    // ponytail: import/resume hydrates from the native jsonl file; a fresh
+    // session has nothing in memory to replay.
+    if (session.nativeSessionId && session.transcript.length === 0) {
+      session.transcript.push(...readNativeTranscript(session.nativeSessionId));
+    }
     for (const item of session.transcript) {
       state.emit({ type: "timeline.item", sessionId: input.sessionId, item });
     }
@@ -869,38 +882,4 @@ function runCommand(
 
 function truncate(text: string, max = 8000): string {
   return text.length > max ? `${text.slice(0, max)}\n…(truncated)` : text;
-}
-
-function toolDetail(
-  name: string,
-  input: Record<string, unknown>,
-  resultText?: string,
-): ProviderToolCallDetail {
-  const stringField = (...keys: string[]): string | undefined => {
-    for (const key of keys) {
-      const value = input[key];
-      if (typeof value === "string" && value) return value;
-    }
-    return undefined;
-  };
-  const path = stringField("path", "file_path", "filePath") ?? name;
-  if (/read|list|directory|catalog/i.test(name)) {
-    return { type: "read", filePath: path, content: resultText };
-  }
-  if (/edit|apply|patch/i.test(name)) {
-    return { type: "edit", filePath: path, newString: resultText };
-  }
-  if (/write|create|save/i.test(name)) {
-    return { type: "write", filePath: path, content: resultText };
-  }
-  if (/search|grep|glob|find/i.test(name)) {
-    return { type: "search", query: stringField("query", "pattern", "text") ?? name, content: resultText };
-  }
-  if (/fetch|web|curl|http/i.test(name)) {
-    return { type: "fetch", url: stringField("url") ?? name, result: resultText };
-  }
-  if (/run|exec|shell|command|bash|terminal/i.test(name)) {
-    return { type: "shell", command: stringField("command") ?? name, output: resultText, exitCode: null };
-  }
-  return { type: "plain_text", label: name, text: resultText ?? "" };
 }

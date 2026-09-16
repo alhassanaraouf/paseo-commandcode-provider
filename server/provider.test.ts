@@ -1,6 +1,10 @@
+import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { buildArgs, parseLine } from "./commandcode.js";
 import { createCommandcodeProvider, type Proc, type SpawnFn } from "./provider.js";
+import { listNativeSessions, readNativeTranscript } from "./sessions.js";
 import { parseSkillsList } from "./skills.js";
 import type { ProviderEvent } from "@getpaseo/plugin/server/provider";
 
@@ -298,5 +302,95 @@ describe("commandcode provider", () => {
     await tick();
     expect(spawnedArgs.at(-1)).toBe("/paseo list projects");
     await connection.close();
+  });
+
+  it("lists native sessions and replays transcripts for import", async () => {
+    const home = mkdtempSync(join(tmpdir(), "cmdc-home-"));
+    const prevHome = process.env.HOME;
+    process.env.HOME = home;
+    try {
+      const dir = join(home, ".commandcode", "projects", "proj");
+      mkdirSync(dir, { recursive: true });
+      const sessionId = "11111111-2222-4333-8444-555555555555";
+      writeFileSync(
+        join(dir, `${sessionId}.jsonl`),
+        [
+          JSON.stringify({ type: "session", id: sessionId, cwd: "/tmp/proj" }),
+          JSON.stringify({
+            type: "message",
+            id: "m1",
+            message: { role: "user", content: [{ type: "text", text: "fix login" }] },
+          }),
+          JSON.stringify({
+            type: "message",
+            id: "m2",
+            message: {
+              role: "assistant",
+              content: [
+                { type: "thinking", thinking: "checking auth" },
+                { type: "text", text: "fixed" },
+                { type: "tool_use", id: "call_1", name: "read_file", input: { path: "a.ts" } },
+              ],
+            },
+          }),
+          JSON.stringify({
+            type: "message",
+            id: "m3",
+            message: {
+              role: "user",
+              content: [{ type: "tool_result", tool_use_id: "call_1", content: [{ type: "text", text: "file contents" }] }],
+            },
+          }),
+        ].join("\n"),
+      );
+      expect(listNativeSessions({})).toHaveLength(1);
+      expect(listNativeSessions({ query: "nope" })).toHaveLength(0);
+      const transcript = readNativeTranscript(sessionId);
+      expect(transcript.map((item) => item.type)).toEqual([
+        "user_message",
+        "reasoning",
+        "assistant_message",
+        "tool_call",
+      ]);
+
+      const connection = await createCommandcodeProvider({
+        spawn: () => {
+          throw new Error("no spawn in import test");
+        },
+        listModels: () => Promise.resolve(""),
+        listSkills: () => Promise.resolve(""),
+      }).connect({
+        versions: [1],
+        capabilities: ["prompt.message", "session.configure", "session.list", "session.persistence"],
+      });
+      const events: ProviderEvent[] = [];
+      connection.onEvent((event) => events.push(event));
+      await connection.send({ type: "sessions", requestId: "l1" });
+      await tick();
+      await tick();
+      const listed = events.find(
+        (event): event is Extract<ProviderEvent, { type: "sessions" }> => event.type === "sessions",
+      );
+      expect(listed?.sessions).toHaveLength(1);
+      expect(listed?.sessions[0].cwd).toBe("/tmp/proj");
+
+      await connection.send({
+        type: "session.open",
+        requestId: "o1",
+        sessionId: "s1",
+        config: { cwd: "/tmp", env: {}, mcpServers: {}, settings: {}, persist: true },
+        persistence: { version: 1, data: { sessionId } },
+        history: "replay",
+      });
+      await tick();
+      await tick();
+      const replayed = events.filter(
+        (event): event is Extract<ProviderEvent, { type: "timeline.item" }> => event.type === "timeline.item",
+      );
+      expect(replayed.length).toBeGreaterThanOrEqual(4);
+      await connection.close();
+    } finally {
+      process.env.HOME = prevHome;
+    }
   });
 });
