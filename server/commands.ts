@@ -8,6 +8,10 @@ export interface CommandDef {
   argv: string[];
   /** Whether output stays visible as a timeline notice (default: side-effect completion). */
   showOutput?: boolean;
+  /** Emit a success notice even when showOutput is false (for mutating commands). */
+  notifyOnSuccess?: boolean;
+  /** Message shown when the command succeeds with no CLI output. */
+  successMessage?: string;
   /** Commands allowed to run while a turn is active. */
   allowWhileRunning?: boolean;
 }
@@ -39,7 +43,8 @@ export const COMMANDS: CommandDef[] = [
     description: "Learn taste from a repo: /taste-learn [path|owner/repo]",
     argumentHint: "[path|owner/repo]",
     argv: ["taste", "learn", "{args}"],
-    allowWhileRunning: true,
+    notifyOnSuccess: true,
+    successMessage: "Taste learned.",
   },
   {
     name: "skills-list",
@@ -53,7 +58,8 @@ export const COMMANDS: CommandDef[] = [
     description: "Install a skill: /skills-add <owner/repo>",
     argumentHint: "<owner/repo>",
     argv: ["skills", "add", "{args}"],
-    allowWhileRunning: true,
+    notifyOnSuccess: true,
+    successMessage: "Skill installed. It will appear in the / menu shortly.",
   },
   {
     name: "mods-list",
@@ -67,7 +73,8 @@ export const COMMANDS: CommandDef[] = [
     description: "Install a mod: /mods-add <npm-name|owner/repo|path>",
     argumentHint: "<source>",
     argv: ["mods", "add", "{args}"],
-    allowWhileRunning: true,
+    notifyOnSuccess: true,
+    successMessage: "Mod installed.",
   },
   {
     name: "mcp-list",

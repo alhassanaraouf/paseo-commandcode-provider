@@ -32,14 +32,16 @@ Then create an agent with the **Command Code** provider.
 - **Models** — full live list from `commandcode --list-models` (1h cache, fallback on failure).
 - **Modes** — Build / Plan (`--plan`).
 - **Effort** — optional per-model selector (low/medium/high/max); omitted by default because valid levels differ per model.
-- **Persistence** — native session id stored opaquely; resume via `--session`, replay on reopen.
+- **Persistence** — native session id + task list stored opaquely; resume via `--session`, replay on reopen (tasks rebuilt from the native transcript).
+- **Health** — probes the CLI (`--version`) on session open; a missing binary or failed probe surfaces an actionable notice (which binary, where it's from, `commandcode login` / `commandcode status` hints) instead of a bare ENOENT.
 - **Commands** (composer `/` menu, side effects via the CLI):
   - `/status`, `/info`, `/models`, `/mcp-list`
   - `/taste-list`, `/taste-learn [path|owner/repo]`
   - `/skills-list`, `/skills-add <owner/repo>`
   - `/mods-list`, `/mods-add <source>`
 - **Skills** — installed skills (`commandcode skills list`) appear in the composer `/` menu and run as agent turns (`/paseo ...`), like other providers.
-- Interrupt kills the running CLI process.
+- Interrupt cancels the running turn (emits `canceled`, no dangling turn).
+- Session titles derive from the first prompt when the host provides none.
 
 ## Known issues
 

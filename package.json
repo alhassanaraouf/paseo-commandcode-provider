@@ -9,6 +9,22 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/alhassanaraouf/paseo-commandcode-provider.git"
+  },
+  "keywords": ["paseo", "commandcode", "provider", "coding-agent"],
+  "files": [
+    "client",
+    "server",
+    "shared",
+    "index.client.tsx",
+    "index.server.ts",
+    "icon.svg",
+    "paseo-plugin.json",
+    "README.md",
+    "LICENSE"
+  ],
   "devDependencies": {
     "@getpaseo/plugin": "0.8.0",
     "@types/node": "^22.9.0",
