@@ -89,8 +89,10 @@ interface Session {
   config: ProviderSessionConfig;
   nativeSessionId: string | null;
   transcript: ProviderTimelineItem[];
-  active: { turnId: string; proc: Proc } | null;
+  active: { turnId: string; proc: Proc; interrupted: boolean } | null;
   tasks: Map<string, { text: string; status: "pending" | "in_progress" | "completed"; activeForm?: string }>;
+  /** First user text, used as the session title when the host didn't provide one. */
+  titleFromPrompt?: string;
 }
 
 interface ModelsCache {
@@ -102,7 +104,10 @@ interface ModelsCache {
 interface ConnectionState {
   sessions: Map<string, Session>;
   emit(event: ProviderEvent): void;
+  log(message: string): void;
   command: string;
+  commandSource: "env" | "settings" | "default";
+  health: HealthState;
   spawn: SpawnFn;
   exec: ExecFn;
   listModels: () => Promise<string>;
@@ -115,7 +120,18 @@ interface ConnectionState {
   skillsFetchedAt: number;
 }
 
+interface HealthState {
+  checked: boolean;
+  ok: boolean;
+  version?: string;
+  error?: string;
+  checkedAt: number;
+}
+
+const HEALTH_TTL_MS = 5 * 60 * 1000;
 const MODELS_TTL_MS = 60 * 60 * 1000;
+const STREAM_FLUSH_MS = 100;
+const STREAM_FLUSH_CHARS = 500;
 
 const execFileAsync = promisify(nodeExecFile);
 
@@ -159,6 +175,7 @@ export function createCommandcodeProvider(options?: {
   listModels?: () => Promise<string>;
   listSkills?: () => Promise<string>;
   modelsCache?: ModelsCache;
+  log?: (message: string) => void;
 }): ProviderRegistration {
   return {
     id: "commandcode",
@@ -173,13 +190,15 @@ export function createCommandcodeProvider(options?: {
         request.capabilities,
         CAPABILITIES as unknown as readonly ProviderCapability[],
       );
-      // ponytail: "cmd" is the Windows shell, so the npm package publishes "cmdc"
-      // as its short alias there; "commandcode" is the cross-platform full name.
       const platformDefault = process.platform === "win32" ? "cmdc" : "commandcode";
       const configured = readSettingsDocument(cliSettings, CLI_DEFAULTS).command.trim();
-      const command = options?.command ?? (configured || platformDefault);
+      const envOverride = process.env.COMMANDCODE_CLI_COMMAND?.trim();
+      const command = options?.command ?? envOverride ?? (configured || platformDefault);
+      const commandSource = options?.command ?? envOverride ? "env" : configured ? "settings" : "default";
       return createConnection(capabilities, {
         command,
+        commandSource,
+        log: options?.log ?? ((message) => console.error(`[commandcode-provider] ${message}`)),
         spawn: options?.spawn ?? defaultSpawn,
         exec: options?.exec ?? defaultExec,
         listModels: options?.listModels ?? (() => runListModels(command)),
@@ -192,7 +211,16 @@ export function createCommandcodeProvider(options?: {
 
 function createConnection(
   capabilities: readonly string[],
-  options: { command: string; spawn: SpawnFn; exec: ExecFn; listModels: () => Promise<string>; listSkills: () => Promise<string>; cache: ModelsCache },
+  options: {
+    command: string;
+    commandSource: ConnectionState["commandSource"];
+    log: (message: string) => void;
+    spawn: SpawnFn;
+    exec: ExecFn;
+    listModels: () => Promise<string>;
+    listSkills: () => Promise<string>;
+    cache: ModelsCache;
+  },
 ): ProviderConnection {
   const listeners = new Set<(event: ProviderEvent) => void>();
   const sessions = new Map<string, Session>();
@@ -203,7 +231,10 @@ function createConnection(
       if (closed) return;
       for (const listener of listeners) listener(event);
     },
+    log: options.log,
     command: options.command,
+    commandSource: options.commandSource,
+    health: { checked: false, ok: false, checkedAt: 0 },
     spawn: options.spawn,
     exec: options.exec,
     listModels: options.listModels,
@@ -273,8 +304,9 @@ async function refreshModels(state: ConnectionState): Promise<boolean> {
       state.cache.fetchedAt = Date.now();
       return true;
     }
-  } catch {
-    // keep the last good list, or the empty list if never refreshed
+    state.log(`list-models returned no models (binary: ${state.command})`);
+  } catch (error) {
+    state.log(`list-models failed (${state.command}): ${error instanceof Error ? error.message : String(error)}`);
   }
   return false;
 }
@@ -294,7 +326,8 @@ async function refreshSkills(state: ConnectionState): Promise<boolean> {
     state.skills = next;
     state.skillsFetchedAt = Date.now();
     return changed;
-  } catch {
+  } catch (error) {
+    state.log(`skills list failed (${state.command}): ${error instanceof Error ? error.message : String(error)}`);
     return false;
   }
 }
@@ -304,6 +337,79 @@ const MODES = [
   { id: "build", label: "Build" },
   { id: "plan", label: "Plan" },
 ] as const;
+
+function binaryHint(state: ConnectionState): string {
+  const source =
+    state.commandSource === "env"
+      ? "from COMMANDCODE_CLI_COMMAND"
+      : state.commandSource === "settings"
+        ? "from Settings → Plugins → Command Code"
+        : `by default on ${process.platform === "win32" ? "Windows (cmdc)" : "this platform (commandcode)"}`;
+  return `CLI binary "${state.command}" (resolved ${source}). Check it's on PATH, or set it in Settings → Plugins → Command Code. Auth issues? Run \`${state.command} login\` or \`${state.command} status\` in a terminal.`;
+}
+
+async function checkHealth(state: ConnectionState, cwd: string): Promise<HealthState> {
+  if (state.health.checked && Date.now() - state.health.checkedAt < HEALTH_TTL_MS) return state.health;
+  try {
+    const env: Record<string, string> = {};
+    for (const [key, value] of Object.entries(process.env)) {
+      if (value !== undefined) env[key] = value;
+    }
+    const { stdout } = await state.exec(state.command, ["--version"], { cwd, env, timeoutMs: 15_000 });
+    const version = stdout.trim().split("\n")[0]?.trim();
+    state.health = { checked: true, ok: true, version: version || undefined, checkedAt: Date.now() };
+    state.log(`health ok: ${state.command}${version ? ` (${version})` : ""}`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    state.health = { checked: true, ok: false, error: message, checkedAt: Date.now() };
+    state.log(`health failed (${state.command}): ${message}`);
+  }
+  return state.health;
+}
+
+function friendlySpawnError(error: unknown, state: ConnectionState): string {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/ENOENT/i.test(message)) {
+    return `Couldn't start "${state.command}" (not found). ${binaryHint(state)}`;
+  }
+  return `${message}. ${binaryHint(state)}`;
+}
+
+function friendlyExitError(stderr: string, code: number | null, state: ConnectionState): string {
+  const detail = truncate(stderr.trim(), 500);
+  if (/not logged in|auth|login|unauthor/i.test(detail)) {
+    return `${detail || `commandcode exited with code ${code}`}. Run \`${state.command} login\` (or \`${state.command} status\`) in a terminal, then retry.`;
+  }
+  if (/unknown flag|invalid|effort/i.test(detail)) {
+    return `${detail}. The selected model may not support this effort level — try a different effort or leave it unset.`;
+  }
+  return `${detail || `commandcode exited with code ${code ?? "unknown"}`}. ${binaryHint(state)}`;
+}
+
+export function makeTitle(configTitle: string | undefined, firstPrompt: string): string | undefined {
+  if (configTitle?.trim()) return configTitle;
+  const oneLine = firstPrompt.replace(/\s+/g, " ").trim();
+  return oneLine ? oneLine.slice(0, 80) : undefined;
+}
+
+type PersistedData = {
+  sessionId?: string;
+  tasks?: Array<{ id: string; text: string; status: "pending" | "in_progress" | "completed"; activeForm?: string }>;
+};
+
+function persistenceData(session: Session): { version: 1; data: PersistedData } {
+  const data: PersistedData = {};
+  if (session.nativeSessionId) data.sessionId = session.nativeSessionId;
+  if (session.tasks.size > 0) {
+    data.tasks = [...session.tasks.entries()].map(([id, task]) => ({
+      id,
+      text: task.text,
+      status: task.status,
+      ...(task.activeForm ? { activeForm: task.activeForm } : {}),
+    }));
+  }
+  return { version: 1, data };
+}
 
 function modelsView(models: ModelInfo[]) {
   return models.map((model) => ({ id: model.id, label: model.label, ...(model.description ? { description: model.description } : {}) }));
@@ -330,7 +436,10 @@ function catalogState(state: ConnectionState) {
   return {
     models: modelsView(state.models),
     modes: MODES.map((mode) => ({ ...mode })),
-    thinkingOptions: EFFORTS.map((effort) => ({ ...effort })),
+    thinkingOptions: EFFORTS.map((effort) => ({
+      ...effort,
+      description: "Levels vary per model — leave unset if the CLI rejects your choice.",
+    })),
     ...(state.defaultModel ? { defaultModel: state.defaultModel } : {}),
     defaultMode: "build",
   };
@@ -361,51 +470,74 @@ function dispatch(input: ProviderInput, state: ConnectionState): void {
       return;
     case "session.interrupt": {
       const session = state.sessions.get(input.sessionId);
-      session?.active?.proc.kill();
+      if (session?.active) {
+        session.active.interrupted = true;
+        session.active.proc.kill();
+      }
       state.emit({ type: "request.completed", requestId: input.requestId });
       return;
     }
-    case "session.close":
-      state.sessions.get(input.sessionId)?.active?.proc.kill();
+    case "session.close": {
+      const session = state.sessions.get(input.sessionId);
+      if (session?.active) {
+        session.active.interrupted = true;
+        session.active.proc.kill();
+      }
       state.sessions.delete(input.sessionId);
       state.emit({ type: "session.closed", sessionId: input.sessionId });
       state.emit({ type: "request.completed", requestId: input.requestId });
       return;
+    }
     default:
       return;
   }
 }
 
-function resumeId(persistence: ProviderPersistence | undefined): string | null {
+function resumeData(persistence: ProviderPersistence | undefined): PersistedData {
   const data = persistence?.data;
-  if (typeof data === "object" && data !== null && !Array.isArray(data)) {
-    const sessionId = (data as Record<string, unknown>).sessionId;
-    return typeof sessionId === "string" ? sessionId : null;
+  if (typeof data !== "object" || data === null || Array.isArray(data)) return {};
+  const record = data as Record<string, unknown>;
+  const out: PersistedData = {};
+  if (typeof record.sessionId === "string") out.sessionId = record.sessionId;
+  if (Array.isArray(record.tasks)) {
+    const tasks: NonNullable<PersistedData["tasks"]> = [];
+    for (const entry of record.tasks) {
+      if (typeof entry !== "object" || entry === null) continue;
+      const task = entry as Record<string, unknown>;
+      if (typeof task.id !== "string" || typeof task.text !== "string") continue;
+      if (task.status !== "pending" && task.status !== "in_progress" && task.status !== "completed") continue;
+      tasks.push({
+        id: task.id,
+        text: task.text,
+        status: task.status,
+        ...(typeof task.activeForm === "string" ? { activeForm: task.activeForm } : {}),
+      });
+    }
+    if (tasks.length > 0) out.tasks = tasks;
   }
-  return null;
+  return out;
 }
 
 function openSession(
   input: Extract<ProviderInput, { type: "session.open" }>,
   state: ConnectionState,
 ): void {
+  const resumed = resumeData(input.persistence);
   const session: Session = {
     config: input.config,
-    nativeSessionId: resumeId(input.persistence),
+    nativeSessionId: resumed.sessionId ?? null,
     transcript: [],
     active: null,
-    tasks: new Map(),
+    tasks: new Map((resumed.tasks ?? []).map((task) => [task.id, { text: task.text, status: task.status, ...(task.activeForm ? { activeForm: task.activeForm } : {}) }])),
   };
   state.sessions.set(input.sessionId, session);
   state.emit({
     type: "session.opened",
     requestId: input.requestId,
     sessionId: input.sessionId,
-    capabilities: ["prompt.message", "prompt.command", "session.configure", "session.persistence"],
+    capabilities: ["prompt.message", "prompt.command", "session.configure", "session.list", "session.persistence"],
     restoration: "core",
-    ...(session.nativeSessionId
-      ? { persistence: { version: 1, data: { sessionId: session.nativeSessionId } } }
-      : {}),
+    ...(session.nativeSessionId || session.tasks.size > 0 ? { persistence: persistenceData(session) } : {}),
     title: input.config.title,
     cwd: input.config.cwd,
   });
@@ -421,11 +553,28 @@ function openSession(
     if (!changed) return;
     state.emit({ type: "session.commands", sessionId: input.sessionId, commands: commandsView(state) });
   });
+  void checkHealth(state, session.config.cwd).then((health) => {
+    if (health.ok || !state.sessions.has(input.sessionId)) return;
+    state.emit({
+      type: "session.notice",
+      sessionId: input.sessionId,
+      notice: {
+        id: `health-${input.sessionId}`,
+        severity: "error",
+        title: `Couldn't reach the Command Code CLI`,
+        description: `${friendlySpawnError(health.error ?? "unknown error", state)}`,
+      },
+    });
+  });
   if (input.history === "replay") {
-    // ponytail: import/resume hydrates from the native jsonl file; a fresh
-    // session has nothing in memory to replay.
     if (session.nativeSessionId && session.transcript.length === 0) {
-      session.transcript.push(...readNativeTranscript(session.nativeSessionId));
+      const replayed = readNativeTranscript(session.nativeSessionId);
+      session.transcript.push(...replayed.items);
+      for (const task of replayed.tasks) {
+        if (!session.tasks.has(task.id)) {
+          session.tasks.set(task.id, { text: task.text, status: task.status });
+        }
+      }
     }
     for (const item of session.transcript) {
       state.emit({ type: "timeline.item", sessionId: input.sessionId, item });
@@ -473,7 +622,10 @@ function configState(session: Session, state?: ConnectionState): ProviderConfigS
     thinkingOption: effort,
     models: modelsView(models),
     modes: MODES.map((mode) => ({ ...mode })),
-    thinkingOptions: EFFORTS.map((option) => ({ ...option })),
+    thinkingOptions: EFFORTS.map((option) => ({
+      ...option,
+      description: "Levels vary per model — leave unset if the CLI rejects your choice.",
+    })),
     // ponytail: single permission knob as a select so state shows beside
     // the label. --auto-accept can't unlock headless writes, so this drives
     // --yolo --tools-all, labeled honestly.
@@ -527,14 +679,21 @@ function configureSession(
   state.emit({ type: "request.completed", requestId: input.requestId });
 }
 
-function promptText(content: ProviderContent[]): { text: string; hasImage: boolean } {
+function promptText(content: ProviderContent[]): { text: string; unsupported: string[] } {
   let text = "";
-  let hasImage = false;
+  const unsupported = new Set<string>();
   for (const part of content) {
     if (part.type === "text") text += (text ? "\n" : "") + part.text;
-    else if (part.type === "image") hasImage = true;
+    else if (part.type === "image") {
+      unsupported.add("Images are not supported by the headless CLI");
+    } else if (part.type === "uploaded_file") {
+      text += (text ? "\n" : "") + `[Attached file: ${part.fileName} (${part.path})]`;
+      unsupported.add("File contents aren't forwarded — reference the file by path instead");
+    } else {
+      unsupported.add(`Attachments of type "${part.type}" are not forwarded`);
+    }
   }
-  return { text, hasImage };
+  return { text, unsupported: [...unsupported] };
 }
 
 function flagsFor(session: Session): RunFlags {
@@ -574,14 +733,26 @@ function promptSession(
     runSlashCommand(input.sessionId, session, input.prompt.clientMessageId, input.prompt.input.name, input.prompt.input.arguments, state);
     return;
   }
-  const { text, hasImage } = promptText(input.prompt.input.content);
-  if (hasImage) {
-    fail("Images are not supported by this provider");
+  const { text, unsupported } = promptText(input.prompt.input.content);
+  if (!text.trim()) {
+    fail(["Empty prompt", ...unsupported].join(". "));
     return;
   }
-  if (!text.trim()) {
-    fail("Empty prompt");
-    return;
+  if (unsupported.length > 0) {
+    const session = state.sessions.get(input.sessionId);
+    if (session) {
+      session.transcript.push({
+        type: "notification",
+        id: `warn-${input.prompt.clientMessageId}`,
+        level: "warning",
+        message: unsupported.join(". "),
+      });
+      state.emit({
+        type: "timeline.item",
+        sessionId: input.sessionId,
+        item: session.transcript[session.transcript.length - 1],
+      });
+    }
   }
   runAgentTurn(input.sessionId, session, input.prompt.clientMessageId, text, state);
 }
@@ -670,6 +841,21 @@ function runAgentTurn(
     value === "pending" || value === "in_progress" || value === "completed" || value === "deleted"
       ? value
       : undefined;
+  if (!session.titleFromPrompt && !text.startsWith("/")) {
+    const title = makeTitle(session.config.title, text);
+    if (title && title !== session.config.title) {
+      session.titleFromPrompt = title;
+      state.emit({
+        type: "session.opened",
+        sessionId,
+        capabilities: ["prompt.message", "prompt.command", "session.configure", "session.list", "session.persistence"],
+        restoration: "core",
+        persistence: persistenceData(session),
+        title: session.titleFromPrompt || undefined,
+        cwd: session.config.cwd,
+      });
+    }
+  }
   push({
     type: "user_message",
     id: `user-${turnId}`,
@@ -696,16 +882,17 @@ function runAgentTurn(
       env,
     });
   } catch (error) {
+    state.log(`spawn failed (${commandFor(session, state)}): ${error instanceof Error ? error.message : String(error)}`);
     state.emit({
       type: "session.turn",
       sessionId,
       turnId,
       state: "failed",
-      error: { message: error instanceof Error ? error.message : String(error) },
+      error: { message: friendlySpawnError(error, state) },
     });
     return;
   }
-  session.active = { turnId, proc };
+  session.active = { turnId, proc, interrupted: false };
 
   let assistantText = "";
   let thinkingText = "";
@@ -716,10 +903,36 @@ function runAgentTurn(
     string,
     { name: string; input: Record<string, unknown>; resultText?: string; status: "running" }
   >();
+  let pendingAssistant = false;
+  let pendingReasoning = false;
+  let lastFlush = 0;
+  const lastFlushLen = { assistant: 0, reasoning: 0 };
+  const flushStream = () => {
+    if (pendingReasoning) {
+      pendingReasoning = false;
+      lastFlushLen.reasoning = thinkingText.length;
+      push({ type: "reasoning", id: `reasoning-${turnId}`, text: thinkingText });
+    }
+    if (pendingAssistant) {
+      pendingAssistant = false;
+      lastFlushLen.assistant = assistantText.length;
+      push({ type: "assistant_message", id: `assistant-${turnId}`, text: assistantText });
+    }
+    lastFlush = Date.now();
+  };
+  const scheduleFlush = () => {
+    if (Date.now() - lastFlush >= STREAM_FLUSH_MS) flushStream();
+  };
   const finish = (terminal: "completed" | "failed" | "canceled", error?: string) => {
     if (finished) return;
     finished = true;
+    flushStream();
     session.active = null;
+    state.emit({
+      type: "session.persistence",
+      sessionId,
+      persistence: persistenceData(session),
+    });
     state.emit({ type: "session.turn", sessionId, turnId, state: terminal, ...(error ? { error: { message: error } } : {}) });
   };
 
@@ -737,29 +950,36 @@ function runAgentTurn(
           state.emit({
             type: "session.persistence",
             sessionId,
-            persistence: { version: 1, data: { sessionId: parsed.sessionId } },
+            persistence: persistenceData(session),
           });
           break;
         case "thinking_delta":
           thinkingText += parsed.delta;
-          push({ type: "reasoning", id: `reasoning-${turnId}`, text: thinkingText });
+          pendingReasoning = true;
+          if (thinkingText.length - lastFlushLen.reasoning >= STREAM_FLUSH_CHARS) flushStream();
+          else scheduleFlush();
           break;
         case "thinking_end":
           thinkingText = parsed.text;
-          push({ type: "reasoning", id: `reasoning-${turnId}`, text: thinkingText });
+          pendingReasoning = true;
+          flushStream();
           break;
         case "text_delta":
           assistantText += parsed.delta;
-          push({ type: "assistant_message", id: `assistant-${turnId}`, text: assistantText });
+          pendingAssistant = true;
+          if (assistantText.length - lastFlushLen.assistant >= STREAM_FLUSH_CHARS) flushStream();
+          else scheduleFlush();
           break;
         case "message_update":
           if (parsed.thinking && parsed.thinking !== thinkingText) {
             thinkingText = parsed.thinking;
-            push({ type: "reasoning", id: `reasoning-${turnId}`, text: thinkingText });
+            pendingReasoning = true;
+            flushStream();
           }
           if (parsed.text && parsed.text !== assistantText) {
             assistantText = parsed.text;
-            push({ type: "assistant_message", id: `assistant-${turnId}`, text: assistantText });
+            pendingAssistant = true;
+            flushStream();
           }
           break;
         case "tool_queued":
@@ -877,12 +1097,12 @@ function runAgentTurn(
             state.emit({
               type: "session.persistence",
               sessionId,
-              persistence: { version: 1, data: { sessionId: parsed.sessionId } },
+              persistence: persistenceData(session),
             });
           }
           if (!assistantText && parsed.finalText) {
             assistantText = parsed.finalText;
-            push({ type: "assistant_message", id: `assistant-${turnId}`, text: assistantText });
+            pendingAssistant = true;
           }
           if (usage && (usage.inputTokens !== undefined || usage.outputTokens !== undefined)) {
             state.emit({ type: "session.usage", sessionId, turnId, usage });
@@ -900,17 +1120,30 @@ function runAgentTurn(
   proc.stderr?.on("data", (chunk) => {
     stderr += chunk.toString();
   });
-  proc.on("error", (error) => {
-    push({ type: "error", id: `error-${turnId}`, message: String(error) });
-    finish("failed", String(error));
+  proc.on("error", (error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    state.log(`turn ${turnId} proc error: ${message}`);
+    const interrupted = session.active?.interrupted;
+    push({ type: "error", id: `error-${turnId}`, message: friendlySpawnError(message, state) });
+    finish(interrupted ? "canceled" : "failed", friendlySpawnError(message, state));
   });
   proc.on("close", (code) => {
     if (finished) return;
+    const interrupted = session.active?.interrupted;
+    if (interrupted) {
+      if (buffer.trim()) onChunk("\n");
+      finish("canceled");
+      return;
+    }
     if (buffer.trim()) onChunk("\n");
     if (typeof code === "number" && code !== 0) {
-      finish("failed", truncate(stderr, 500) || `commandcode exited with code ${code}`);
+      const message = friendlyExitError(stderr, code, state);
+      state.log(`turn ${turnId} exited ${code}: ${truncate(stderr.trim(), 200) || "no stderr"}`);
+      finish("failed", message);
+    } else if (code === null || code === undefined) {
+      finish("canceled");
     } else {
-      finish(assistantText ? "completed" : "failed", assistantText ? undefined : "No response");
+      finish(assistantText ? "completed" : "failed", assistantText ? undefined : `No response from the CLI. ${binaryHint(state)}`);
     }
   });
 }
@@ -949,7 +1182,7 @@ function runCommand(
     .exec(commandFor(session, state), argv, { cwd: session.config.cwd, env, timeoutMs: 120_000 })
     .then(({ stdout, stderr }) => {
       const output = [stdout.trim(), stderr.trim()].filter(Boolean).join("\n");
-      if (def.showOutput) {
+      if (def.showOutput || def.notifyOnSuccess) {
         state.emit({
           type: "session.notice",
           sessionId,
@@ -957,16 +1190,18 @@ function runCommand(
             id: `cmd-${clientMessageId}`,
             severity: "info",
             title: `/${name}`,
-            description: truncate(output || "(no output)", 4000),
+            description: truncate(output || def.successMessage || "(no output)", 4000),
           },
         });
       }
       done({ type: "completed" });
     })
     .catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      state.log(`/${name} failed: ${message}`);
       done({
         type: "failed",
-        error: { message: `/${name} failed: ${error instanceof Error ? error.message : String(error)}` },
+        error: { message: `/${name} failed: ${friendlySpawnError(message, state)}` },
       });
     });
 }

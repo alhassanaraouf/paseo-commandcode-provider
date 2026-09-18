@@ -7,6 +7,11 @@ import type {
   ProviderTimelineItem,
   ProviderToolCallDetail,
 } from "@getpaseo/plugin/server/provider";
+import type { JsonValue } from "@getpaseo/protocol/agent-types";
+
+const MAX_TRANSCRIPT_BYTES = 5 * 1024 * 1024;
+const MAX_SUMMARY_LINES = 400;
+const MAX_SUMMARY_BYTES = 1024 * 1024;
 
 export function nativeProjectsDir(): string {
   return join(homedir(), ".commandcode", "projects");
@@ -17,19 +22,42 @@ interface NativeSummary {
   cwd: string;
   firstPrompt?: string;
   lastText?: string;
+  lastAt?: string;
   model?: string;
   mtimeMs: number;
 }
 
-function readSummary(path: string): NativeSummary | null {
+function readSlice(path: string, maxBytes: number): string | null {
   try {
     const stat = statSync(path);
+    if (stat.size > maxBytes * 4) return null;
     const raw = readFileSync(path, "utf8");
+    return raw.length > maxBytes ? raw.slice(-maxBytes) : raw;
+  } catch {
+    return null;
+  }
+}
+
+function readSummary(path: string): NativeSummary | null {
+  const stat = (() => {
+    try {
+      return statSync(path);
+    } catch {
+      return null;
+    }
+  })();
+  if (!stat) return null;
+  const raw = readSlice(path, MAX_SUMMARY_BYTES);
+  if (raw === null) {
+    return { sessionId: "", cwd: "", mtimeMs: stat.mtimeMs };
+  }
+  try {
     const lines = raw.split("\n");
     let sessionId: string | undefined;
     let cwd = "";
     let firstPrompt: string | undefined;
     let lastText: string | undefined;
+    let lastAt: string | undefined;
     let model: string | undefined;
     let count = 0;
     for (const line of lines) {
@@ -50,6 +78,7 @@ function readSummary(path: string): NativeSummary | null {
       if (!message || !Array.isArray(message.content)) continue;
       if (record.usage && typeof record.model === "string") model = record.model as string;
       else if (typeof record.model === "string") model = model ?? (record.model as string);
+      if (typeof record.timestamp === "string") lastAt = record.timestamp as string;
       const text = message.content
         .filter((part) => part?.type === "text" && typeof part.text === "string")
         .map((part) => part.text as string)
@@ -58,10 +87,10 @@ function readSummary(path: string): NativeSummary | null {
       if (!text) continue;
       if (message.role === "user" && !firstPrompt) firstPrompt = text;
       if (message.role === "assistant") lastText = text;
-      if (++count > 400) break;
+      if (++count > MAX_SUMMARY_LINES) break;
     }
     if (!sessionId) return null;
-    return { sessionId, cwd, firstPrompt, lastText, model, mtimeMs: stat.mtimeMs };
+    return { sessionId, cwd, firstPrompt, lastText, lastAt, model, mtimeMs: stat.mtimeMs };
   } catch {
     return null;
   }
@@ -142,7 +171,7 @@ export function listNativeSessions(options: ListNativeOptions = {}): ProviderSes
       cwd: summary.cwd || options.cwd || "",
       ...(summary.firstPrompt ? { title: summary.firstPrompt.slice(0, 80) } : {}),
       ...(summary.lastText ? { description: summary.lastText.slice(0, 200) } : {}),
-      updatedAt: new Date(summary.mtimeMs).toISOString(),
+      updatedAt: summary.lastAt ?? new Date(summary.mtimeMs).toISOString(),
     });
     if (summaries.length >= limit) break;
   }
@@ -165,38 +194,37 @@ export function toolDetail(
     }
     return undefined;
   };
-  const path = stringField("path", "file_path", "filePath") ?? name;
-  if (/read|list|directory|catalog/i.test(name)) {
-    return { type: "read", filePath: path, content: resultText };
+  const path = stringField("path", "file_path", "filePath");
+  const rest: Record<string, unknown> = { ...input };
+  if (/^(read|edit|write|search|fetch|shell|run|exec|bash|terminal|glob|grep|find|list|web|http|curl)/i.test(name)) {
+    if (/read|list|directory|catalog/i.test(name)) {
+      return { type: "read", filePath: path ?? "(unknown path)", content: resultText };
+    }
+    if (/edit|apply|patch/i.test(name)) {
+      return { type: "edit", filePath: path ?? "(unknown path)", newString: resultText };
+    }
+    if (/write|create|save/i.test(name)) {
+      return { type: "write", filePath: path ?? "(unknown path)", content: resultText };
+    }
+    if (/search|grep|glob|find/i.test(name)) {
+      return { type: "search", query: stringField("query", "pattern", "text") ?? name, content: resultText };
+    }
+    if (/fetch|web|curl|http/i.test(name)) {
+      return { type: "fetch", url: stringField("url") ?? "(unknown url)", result: resultText };
+    }
+    if (/run|exec|shell|command|bash|terminal/i.test(name)) {
+      return { type: "shell", command: stringField("command") ?? name, output: resultText, exitCode: null };
+    }
   }
-  if (/edit|apply|patch/i.test(name)) {
-    return { type: "edit", filePath: path, newString: resultText };
-  }
-  if (/write|create|save/i.test(name)) {
-    return { type: "write", filePath: path, content: resultText };
-  }
-  if (/search|grep|glob|find/i.test(name)) {
-    return { type: "search", query: stringField("query", "pattern", "text") ?? name, content: resultText };
-  }
-  if (/fetch|web|curl|http/i.test(name)) {
-    return { type: "fetch", url: stringField("url") ?? name, result: resultText };
-  }
-  if (/run|exec|shell|command|bash|terminal/i.test(name)) {
-    return { type: "shell", command: stringField("command") ?? name, output: resultText, exitCode: null };
-  }
-  return { type: "plain_text", label: name, text: resultText ?? "" };
+  return { type: "unknown", input: rest as JsonValue, output: resultText ?? "" };
 }
 
 /** Replay a native transcript file as provider timeline snapshots. */
-export function readNativeTranscript(sessionId: string): ProviderTimelineItem[] {
+export function readNativeTranscript(sessionId: string): { items: ProviderTimelineItem[]; tasks: Array<{ id: string; text: string; status: "pending" | "in_progress" | "completed" }> } {
   const path = findNativeSessionFile(sessionId);
-  if (!path) return [];
-  let raw: string;
-  try {
-    raw = readFileSync(path, "utf8");
-  } catch {
-    return [];
-  }
+  if (!path) return { items: [], tasks: [] };
+  const raw = readSlice(path, MAX_TRANSCRIPT_BYTES);
+  if (raw === null) return { items: [], tasks: [] };
   const toolResults = new Map<string, string>();
   const records: Array<{ id: string; role: string; content: Array<Record<string, unknown>> }> = [];
   for (const line of raw.split("\n")) {
@@ -227,6 +255,7 @@ export function readNativeTranscript(sessionId: string): ProviderTimelineItem[] 
     }
   }
   const items: ProviderTimelineItem[] = [];
+  const tasks = new Map<string, { text: string; status: "pending" | "in_progress" | "completed" }>();
   for (const record of records) {
     if (record.role === "user") {
       const text = record.content
@@ -263,7 +292,54 @@ export function readNativeTranscript(sessionId: string): ProviderTimelineItem[] 
         status: "completed",
         error: null,
       });
+      trackReplayedTask(tasks, part.name as string, input, result ?? "");
     }
   }
-  return items;
+  if (tasks.size > 0) {
+    items.push({
+      type: "todo",
+      id: "tasks",
+      items: [...tasks.entries()].map(([id, task]) => ({
+        id,
+        text: task.text,
+        completed: task.status === "completed",
+        status: task.status,
+      })),
+    });
+  }
+  return { items, tasks: [...tasks.entries()].map(([id, task]) => ({ id, ...task })) };
+}
+
+function trackReplayedTask(
+  tasks: Map<string, { text: string; status: "pending" | "in_progress" | "completed" }>,
+  name: string,
+  input: Record<string, unknown>,
+  resultText: string,
+): void {
+  const statusOf = (value: unknown): "pending" | "in_progress" | "completed" | undefined =>
+    value === "pending" || value === "in_progress" || value === "completed" ? value : undefined;
+  if (name === "task_list") {
+    for (const line of resultText.split("\n")) {
+      const match = /^#([A-Za-z0-9_-]+)\s+\[(pending|in_progress|completed)\]\s+(.+?)\s*$/.exec(line.trim());
+      if (match) tasks.set(match[1], { text: match[3], status: match[2] as "pending" | "in_progress" | "completed" });
+    }
+    return;
+  }
+  if (name === "task_create" || name === "task_update") {
+    const id = typeof input.taskId === "string" && input.taskId
+      ? input.taskId
+      : /(?:Task|task) #([A-Za-z0-9_-]+)/.exec(resultText)?.[1];
+    if (!id) return;
+    if (name === "task_update" && input.status === "deleted") {
+      tasks.delete(id);
+      return;
+    }
+    const subject = typeof input.subject === "string" && input.subject
+      ? input.subject
+      : typeof input.description === "string" && input.description
+        ? input.description
+        : /^Task #\S+ created:\s*(.+?)\s*$/.exec(resultText)?.[1];
+    const status = statusOf(input.status) ?? tasks.get(id)?.status ?? "pending";
+    tasks.set(id, { text: subject ?? tasks.get(id)?.text ?? `Task ${id}`, status });
+  }
 }

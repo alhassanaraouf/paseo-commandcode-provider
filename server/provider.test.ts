@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { buildArgs, parseLine, parseTaskGet, parseTaskId, parseTaskList } from "./commandcode.js";
-import { createCommandcodeProvider, type Proc, type SpawnFn } from "./provider.js";
+import { createCommandcodeProvider, makeTitle, type Proc, type SpawnFn } from "./provider.js";
 import { listNativeSessions, readNativeTranscript } from "./sessions.js";
 import { parseSkillsList } from "./skills.js";
 import type { ProviderEvent } from "@getpaseo/plugin/server/provider";
@@ -56,12 +56,14 @@ describe("commandcode provider", () => {
         throw new Error("no spawn in command test");
       },
       exec: (cmd, args) => {
+        if (args[0] === "--version") return Promise.resolve({ stdout: "1.0.0", stderr: "" });
         expect(cmd).toBe("commandcode");
         expect(args).toEqual(["taste", "list"]);
         return Promise.resolve({ stdout: "no packages", stderr: "" });
       },
       listModels: () => Promise.resolve("fallback-model  fallback (default)"),
       listSkills: () => Promise.resolve(""),
+      log: () => {},
     }).connect({
       versions: [1],
       capabilities: ["prompt.message", "prompt.command", "session.configure", "session.persistence"],
@@ -134,6 +136,7 @@ describe("commandcode provider", () => {
         throw new Error("no spawn in catalog test");
       },
       listModels: () => Promise.resolve(fakeModels),
+      log: () => {},
     }).connect({ versions: [1], capabilities: ["prompt.message"] });
     const events: ProviderEvent[] = [];
     connection.onEvent((event) => events.push(event));
@@ -154,6 +157,7 @@ describe("commandcode provider", () => {
         throw new Error("no spawn in catalog test");
       },
       listModels: () => Promise.reject(new Error("cli exploded")),
+      log: () => {},
     }).connect({ versions: [1], capabilities: ["prompt.message"] });
     const events: ProviderEvent[] = [];
     connection.onEvent((event) => events.push(event));
@@ -185,6 +189,7 @@ describe("commandcode provider", () => {
     const connection = await createCommandcodeProvider({
       spawn: fakeSpawn,
       listModels: () => Promise.resolve("fallback-model  fallback (default)"),
+      log: () => {},
     }).connect({
       versions: [1],
       capabilities: ["prompt.message", "session.configure", "session.persistence"],
@@ -278,6 +283,7 @@ describe("commandcode provider", () => {
     const connection = await createCommandcodeProvider({
       spawn: fakeSpawn,
       listModels: () => Promise.resolve("fallback-model  fallback (default)"),
+      log: () => {},
     }).connect({
       versions: [1],
       capabilities: ["prompt.message", "session.configure", "session.persistence"],
@@ -423,7 +429,7 @@ describe("commandcode provider", () => {
       expect(listNativeSessions({})).toHaveLength(1);
       expect(listNativeSessions({ query: "nope" })).toHaveLength(0);
       const transcript = readNativeTranscript(sessionId);
-      expect(transcript.map((item) => item.type)).toEqual([
+      expect(transcript.items.map((item) => item.type)).toEqual([
         "user_message",
         "reasoning",
         "assistant_message",
@@ -469,5 +475,199 @@ describe("commandcode provider", () => {
     } finally {
       process.env.HOME = prevHome;
     }
+  });
+
+  it("emits health notice when the CLI binary is missing", async () => {
+    const connection = await createCommandcodeProvider({
+      command: "definitely-not-a-real-binary-xyz",
+      spawn: () => {
+        throw new Error("no spawn in health test");
+      },
+      exec: () => Promise.reject(new Error("spawn definitely-not-a-real-binary-xyz ENOENT")),
+      listModels: () => Promise.reject(new Error("spawn definitely-not-a-real-binary-xyz ENOENT")),
+      listSkills: () => Promise.resolve(""),
+      log: () => {},
+    }).connect({
+      versions: [1],
+      capabilities: ["prompt.message", "prompt.command", "session.configure", "session.persistence"],
+    });
+    const events: ProviderEvent[] = [];
+    connection.onEvent((event) => events.push(event));
+    await connection.send({
+      type: "session.open",
+      requestId: "o1",
+      sessionId: "s1",
+      config: { cwd: "/tmp", env: {}, mcpServers: {}, settings: {}, persist: false },
+      history: "skip",
+    });
+    await tick();
+    await tick();
+    const notice = events.find(
+      (event): event is Extract<ProviderEvent, { type: "session.notice" }> => event.type === "session.notice",
+    );
+    expect(notice?.notice.severity).toBe("error");
+    expect(notice?.notice.description).toMatch(/not found|on PATH/i);
+    await connection.close();
+  });
+
+  it("fails turns with actionable ENOENT errors", async () => {
+    const connection = await createCommandcodeProvider({
+      command: "missing-binary",
+      spawn: () => {
+        throw new Error("spawn missing-binary ENOENT");
+      },
+      log: () => {},
+    }).connect({
+      versions: [1],
+      capabilities: ["prompt.message", "session.configure", "session.persistence"],
+    });
+    const events: ProviderEvent[] = [];
+    connection.onEvent((event) => events.push(event));
+    await connection.send({
+      type: "session.open",
+      requestId: "o1",
+      sessionId: "s1",
+      config: { cwd: "/tmp", env: {}, mcpServers: {}, settings: {}, persist: false },
+      history: "skip",
+    });
+    await tick();
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: {
+        clientMessageId: "m1",
+        delivery: "auto",
+        input: { type: "message", content: [{ type: "text", text: "hello" }] },
+      },
+    });
+    await tick();
+    await tick();
+    const turnFailed = events.find(
+      (event): event is Extract<ProviderEvent, { type: "session.turn" }> =>
+        event.type === "session.turn" && event.state === "failed",
+    );
+    expect(turnFailed?.error?.message).toMatch(/not found|on PATH/i);
+    await connection.close();
+  });
+
+  it("emits canceled when a turn is interrupted", async () => {
+    const stdout = stream();
+    const stderr = stream();
+    const procEvents = stream();
+    let killed = false;
+    const fakeSpawn: SpawnFn = () => {
+      return {
+        stdout: stdout as unknown as Proc["stdout"],
+        stderr: stderr as unknown as Proc["stderr"],
+        on: procEvents.on,
+        kill: () => {
+          killed = true;
+          procEvents.emit("close", null);
+        },
+      } as Proc;
+    };
+    const connection = await createCommandcodeProvider({
+      spawn: fakeSpawn,
+      listModels: () => Promise.resolve(""),
+      log: () => {},
+    }).connect({
+      versions: [1],
+      capabilities: ["prompt.message", "session.configure", "session.persistence"],
+    });
+    const events: ProviderEvent[] = [];
+    connection.onEvent((event) => events.push(event));
+    await connection.send({
+      type: "session.open",
+      requestId: "o1",
+      sessionId: "s1",
+      config: { cwd: "/tmp", env: {}, mcpServers: {}, settings: {}, persist: false },
+      history: "skip",
+    });
+    await tick();
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: {
+        clientMessageId: "m1",
+        delivery: "auto",
+        input: { type: "message", content: [{ type: "text", text: "hello" }] },
+      },
+    });
+    await tick();
+    await connection.send({ type: "session.interrupt", requestId: "i1", sessionId: "s1" });
+    await tick();
+    await tick();
+    expect(killed).toBe(true);
+    const canceled = events.find(
+      (event): event is Extract<ProviderEvent, { type: "session.turn" }> =>
+        event.type === "session.turn" && event.state === "canceled",
+    );
+    expect(canceled).toBeDefined();
+    await connection.close();
+  });
+
+  it("derives titles from the first prompt", () => {
+    expect(makeTitle(undefined, "  fix the login bug\nplease  ")).toBe("fix the login bug please");
+    expect(makeTitle("Custom", "anything")).toBe("Custom");
+    expect(makeTitle(undefined, "")).toBeUndefined();
+  });
+
+  it("persists tasks across reconnects", async () => {
+    const stdout = stream();
+    const stderr = stream();
+    const procEvents = stream();
+    const fakeSpawn: SpawnFn = () => {
+      return {
+        stdout: stdout as unknown as Proc["stdout"],
+        stderr: stderr as unknown as Proc["stderr"],
+        on: procEvents.on,
+        kill: () => {},
+      } as Proc;
+    };
+    const connection = await createCommandcodeProvider({
+      spawn: fakeSpawn,
+      listModels: () => Promise.resolve(""),
+      log: () => {},
+    }).connect({
+      versions: [1],
+      capabilities: ["prompt.message", "session.configure", "session.persistence"],
+    });
+    const events: ProviderEvent[] = [];
+    connection.onEvent((event) => events.push(event));
+    await connection.send({
+      type: "session.open",
+      requestId: "o1",
+      sessionId: "s1",
+      config: { cwd: "/tmp", env: {}, mcpServers: {}, settings: {}, persist: true },
+      history: "skip",
+    });
+    await tick();
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: {
+        clientMessageId: "m1",
+        delivery: "auto",
+        input: { type: "message", content: [{ type: "text", text: "hello" }] },
+      },
+    });
+    await tick();
+    stdout.emit(
+      "data",
+      '{"type":"event","event":{"type":"tool_queued","toolCallId":"c1","toolName":"task_create","input":{"subject":"Write docs"}}}\n' +
+        '{"type":"event","event":{"type":"tool_completed","toolCallId":"c1","toolName":"task_create","result":[{"type":"text","text":"Task #7 created: Write docs"}]}}\n' +
+        '{"type":"result","subtype":"success","sessionId":"native-1","finalText":"done"}\n',
+    );
+    procEvents.emit("close", 0);
+    await tick();
+    await tick();
+    const persisted = events.filter(
+      (event): event is Extract<ProviderEvent, { type: "session.persistence" }> =>
+        event.type === "session.persistence",
+    );
+    const latest = persisted.at(-1);
+    const data = (latest?.persistence.data ?? {}) as { tasks?: Array<{ id: string }> };
+    expect(data.tasks?.map((task) => task.id)).toContain("7");
+    await connection.close();
   });
 });

@@ -1,5 +1,10 @@
 {
   "id": "commandcode-provider",
+  "name": "Command Code",
+  "description": "Paseo provider for the Command Code coding agent (headless via `commandcode -p`)",
+  "version": "0.1.0",
+  "author": "Al-Hassan Abdel-Raouf",
+  "homepage": "https://github.com/alhassanaraouf/paseo-commandcode-provider",
   "requirements": {
     "paseo": ">=0.8.0"
   }
