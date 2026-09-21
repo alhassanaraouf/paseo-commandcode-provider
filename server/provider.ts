@@ -903,23 +903,28 @@ function runAgentTurn(
   let pendingAssistant = false;
   let pendingReasoning = false;
   let reasoningBlock = 0;
+  // The implicit block (thinking deltas before any thinking_start) owns id 0,
+  // so the first explicit block pre-increments to keep every id unique.
   let reasoningId = `reasoning-${turnId}-${reasoningBlock}`;
   // Paseo turns repeated provider snapshots into separate timeline deltas.
-  // Emit each logical block only once so the UI cannot fragment it.
-  const flushStream = () => {
-    if (pendingReasoning) {
-      pendingReasoning = false;
-      if (thinkingText) push({ type: "reasoning", id: reasoningId, text: thinkingText });
-    }
-    if (pendingAssistant) {
-      pendingAssistant = false;
-      if (assistantText) push({ type: "assistant_message", id: `assistant-${turnId}`, text: assistantText });
-    }
+  // Thinking flushes once per block (thinking_end), the assistant text once at
+  // the end of the run, so a later thinking/tool cycle cannot emit it early or
+  // fragment it. Tools keep streaming live.
+  const flushReasoning = () => {
+    if (!pendingReasoning) return;
+    pendingReasoning = false;
+    if (thinkingText) push({ type: "reasoning", id: reasoningId, text: thinkingText });
+  };
+  const flushAssistant = () => {
+    if (!pendingAssistant) return;
+    pendingAssistant = false;
+    if (assistantText) push({ type: "assistant_message", id: `assistant-${turnId}`, text: assistantText });
   };
   const finish = (terminal: "completed" | "failed" | "canceled", error?: string) => {
     if (finished) return;
     finished = true;
-    flushStream();
+    flushReasoning();
+    flushAssistant();
     session.active = null;
     state.emit({
       type: "session.persistence",
@@ -947,8 +952,8 @@ function runAgentTurn(
           });
           break;
         case "thinking_start":
-          if (pendingReasoning) flushStream();
-          reasoningId = `reasoning-${turnId}-${reasoningBlock++}`;
+          if (pendingReasoning) flushReasoning();
+          reasoningId = `reasoning-${turnId}-${++reasoningBlock}`;
           thinkingText = "";
           break;
         case "thinking_delta":
@@ -958,7 +963,7 @@ function runAgentTurn(
         case "thinking_end":
           thinkingText = parsed.text;
           pendingReasoning = true;
-          flushStream();
+          flushReasoning();
           break;
         case "text_delta":
           assistantText += parsed.delta;
