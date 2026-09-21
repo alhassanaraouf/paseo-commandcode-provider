@@ -26,6 +26,7 @@ const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
 
 describe("commandcode provider", () => {
   it("parses NDJSON lines and builds headless args", () => {
+    expect(parseLine('{"type":"event","event":{"type":"thinking_start"}}').kind).toBe("thinking_start");
     expect(parseLine('{"type":"event","event":{"type":"text_delta","delta":"hi"}}').kind).toBe("text_delta");
     expect(parseLine("not json").kind).toBe("ignored");
     expect(buildArgs({ model: "m", effort: "high", resumeSessionId: "s1" }, "hello")).toEqual([
@@ -251,6 +252,73 @@ describe("commandcode provider", () => {
         event.type === "session.turn" && event.state === "completed",
     );
     expect(turnDone).toBeDefined();
+    await connection.close();
+  });
+
+  it("accumulates streamed thinking and text without rendering message snapshots", async () => {
+    const stdout = stream();
+    const stderr = stream();
+    const procEvents = stream();
+    const fakeSpawn: SpawnFn = () => ({
+      stdout: stdout as unknown as Proc["stdout"],
+      stderr: stderr as unknown as Proc["stderr"],
+      on: procEvents.on,
+      kill: () => {},
+    }) as Proc;
+    const connection = await createCommandcodeProvider({
+      spawn: fakeSpawn,
+      listModels: () => Promise.resolve("fallback-model  fallback (default)"),
+      log: () => {},
+    }).connect({
+      versions: [1],
+      capabilities: ["prompt.message", "session.configure", "session.persistence"],
+    });
+    const events: ProviderEvent[] = [];
+    connection.onEvent((event) => events.push(event));
+    await connection.send({
+      type: "session.open",
+      requestId: "o1",
+      sessionId: "s1",
+      config: { cwd: "/tmp", env: {}, mcpServers: {}, settings: {}, persist: false },
+      history: "skip",
+    });
+    await tick();
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: {
+        clientMessageId: "m1",
+        delivery: "auto",
+        input: { type: "message", content: [{ type: "text", text: "hello" }] },
+      },
+    });
+    await tick();
+
+    stdout.emit("data", [
+      { type: "event", event: { type: "thinking_start" } },
+      { type: "event", event: { type: "thinking_delta", delta: "check " } },
+      { type: "event", event: { type: "thinking_delta", delta: "the code" } },
+      { type: "event", event: { type: "thinking_end", text: "check the code" } },
+      { type: "event", event: { type: "text_delta", delta: "Fixed " } },
+      { type: "event", event: { type: "message_update", content: [{ type: "thinking", thinking: "check the code" }, { type: "text", text: "Fixed it." }] } },
+      { type: "event", event: { type: "tool_queued", toolCallId: "call-1", toolName: "read_file", input: { path: "a.ts" } } },
+      { type: "event", event: { type: "tool_completed", toolCallId: "call-1", toolName: "read_file", result: [{ type: "text", text: "contents" }] } },
+      { type: "event", event: { type: "text_delta", delta: "it." } },
+      { type: "result", sessionId: "native-1", finalText: "Fixed it." },
+    ].map((event) => JSON.stringify(event)).join("\n") + "\n");
+    procEvents.emit("close", 0);
+    await tick();
+
+    const timeline = events.filter(
+      (event): event is Extract<ProviderEvent, { type: "timeline.item" }> => event.type === "timeline.item",
+    );
+    const reasoning = timeline.filter((event) => event.item.type === "reasoning");
+    const assistant = timeline.filter((event) => event.item.type === "assistant_message");
+    expect(reasoning).toHaveLength(1);
+    expect(reasoning.at(-1)?.item).toMatchObject({ type: "reasoning", text: "check the code" });
+    expect(assistant).toHaveLength(1);
+    expect(assistant.at(-1)?.item).toMatchObject({ type: "assistant_message", text: "Fixed it." });
+    expect(timeline.filter((event) => event.item.type === "tool_call")).toHaveLength(2);
     await connection.close();
   });
 

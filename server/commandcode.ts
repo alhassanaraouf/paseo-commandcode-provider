@@ -7,6 +7,7 @@ export interface ToolUsage {
 
 export type CommandcodeLine =
   | { kind: "run_start"; sessionId: string }
+  | { kind: "thinking_start" }
   | { kind: "thinking_delta"; delta: string }
   | { kind: "thinking_end"; text: string }
   | { kind: "text_delta"; delta: string }
@@ -68,6 +69,8 @@ export function parseLine(line: string): CommandcodeLine {
       return typeof event.sessionId === "string"
         ? { kind: "run_start", sessionId: event.sessionId }
         : { kind: "ignored" };
+    case "thinking_start":
+      return { kind: "thinking_start" };
     case "thinking_delta":
       return typeof event.delta === "string"
         ? { kind: "thinking_delta", delta: event.delta }
