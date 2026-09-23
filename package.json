@@ -1,7 +1,6 @@
 {
-  "name": "commandcode-provider",
-  "private": true,
-  "version": "0.1.0",
+  "name": "paseo-commandcode-provider",
+  "version": "0.1.1",
   "description": "Paseo provider plugin for the Command Code coding agent",
   "author": "Al-Hassan Abdel-Raouf",
   "license": "MIT",
@@ -21,6 +20,7 @@
     "index.client.tsx",
     "index.server.ts",
     "icon.svg",
+    "images",
     "paseo-plugin.json",
     "README.md",
     "LICENSE"
