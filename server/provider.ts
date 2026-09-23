@@ -99,6 +99,8 @@ interface ModelsCache {
   models: ModelInfo[];
   defaultModel?: string;
   fetchedAt: number;
+  /** Models known (via rejection probe) to accept no --effort flag. */
+  noEffortModels?: string[];
 }
 
 interface ConnectionState {
@@ -116,6 +118,8 @@ interface ConnectionState {
   defaultModel?: string;
   modelsFetchedAt: number;
   cache: ModelsCache;
+  /** Models known (via rejection probe) to accept no --effort flag. */
+  noEffortModels: Set<string>;
   skills: Map<string, SkillInfo>;
   skillsFetchedAt: number;
 }
@@ -243,6 +247,10 @@ function createConnection(
     defaultModel: options.cache.defaultModel,
     modelsFetchedAt: 0,
     cache: options.cache,
+    // ponytail: ModelsCache is shared across connections, so the Set itself
+    // must be shared too — otherwise probes learned on one connection would
+    // be invisible on the next (each connection would emit stale options).
+    noEffortModels: new Set(options.cache.noEffortModels ?? []),
     skills: new Map(),
     skillsFetchedAt: 0,
   };
@@ -386,6 +394,14 @@ function friendlyExitError(stderr: string, code: number | null, state: Connectio
   return `${detail || `commandcode exited with code ${code ?? "unknown"}`}. ${binaryHint(state)}`;
 }
 
+// ponytail: stale thinkingOptions survive model switches (the host keeps the
+// pill value per agent), and models with no adjustable effort (e.g. mimo
+// flash) reject --effort at startup — retry those turns without the flag
+function isEffortRejection(stderr: string): boolean {
+  if (/no adjustable reasoning effort/i.test(stderr)) return true;
+  return /effort/i.test(stderr) && /not support|unsupported|invalid|unknown flag/i.test(stderr);
+}
+
 export function makeTitle(configTitle: string | undefined, firstPrompt: string): string | undefined {
   if (configTitle?.trim()) return configTitle;
   const oneLine = firstPrompt.replace(/\s+/g, " ").trim();
@@ -411,8 +427,15 @@ function persistenceData(session: Session): { version: 1; data: PersistedData } 
   return { version: 1, data };
 }
 
-function modelsView(models: ModelInfo[]) {
-  return models.map((model) => ({ id: model.id, label: model.label, ...(model.description ? { description: model.description } : {}) }));
+function modelsView(models: ModelInfo[], noEffortModels?: Set<string>) {
+  return models.map((model) => ({
+    id: model.id,
+    label: model.label,
+    ...(model.description ? { description: model.description } : {}),
+    // ponytail: the CLI rejects --effort for some models (e.g. mimo flash) —
+    // per-model thinkingOptions lets the host hide the Thinking pill there
+    ...(noEffortModels?.has(model.id) ? { thinkingOptions: [] } : {}),
+  }));
 }
 
 function commandsView(state?: ConnectionState) {
@@ -434,7 +457,7 @@ function commandsView(state?: ConnectionState) {
 
 function catalogState(state: ConnectionState) {
   return {
-    models: modelsView(state.models),
+    models: modelsView(state.models, state.noEffortModels),
     modes: MODES.map((mode) => ({ ...mode })),
     thinkingOptions: EFFORTS.map((effort) => ({
       ...effort,
@@ -604,23 +627,27 @@ function commandFor(session: Session, state: ConnectionState): string {
   return session.config.env.COMMANDCODE_CLI_COMMAND?.trim() || state.command;
 }
 
-function effortOf(session: Session): string | undefined {
+function effortOf(session: Session, state?: ConnectionState): string | undefined {
   // ponytail: effort lives only in the native Thinking pill (thinkingOptions);
   // the custom select was a duplicate, so settings are ignored here
   const raw = session.config.thinkingOption;
-  return typeof raw === "string" && EFFORTS.some((effort) => effort.id === raw) ? raw : undefined;
+  if (typeof raw !== "string" || !EFFORTS.some((effort) => effort.id === raw)) return undefined;
+  // ponytail: models probed as effortless (e.g. mimo flash) reject --effort —
+  // never send the flag for them, even if the host kept a stale pill value
+  if (state && session.config.model && state.noEffortModels.has(session.config.model)) return undefined;
+  return raw;
 }
 
 function configState(session: Session, state?: ConnectionState): ProviderConfigState {
   const settings = session.config.settings as Record<string, unknown>;
-  const effort = effortOf(session);
+  const effort = effortOf(session, state);
   const models = state?.models ?? [];
   const defaultModel = state?.defaultModel ?? session.config.model;
   return {
     ...(session.config.model ?? defaultModel ? { model: session.config.model ?? defaultModel } : {}),
     mode: session.config.mode ?? "build",
     thinkingOption: effort,
-    models: modelsView(models),
+    models: modelsView(models, state?.noEffortModels),
     modes: MODES.map((mode) => ({ ...mode })),
     thinkingOptions: EFFORTS.map((option) => ({
       ...option,
@@ -642,6 +669,12 @@ function configState(session: Session, state?: ConnectionState): ProviderConfigS
       },
     ],
   };
+}
+
+function refreshAllSessionsConfig(state: ConnectionState): void {
+  for (const [id, session] of state.sessions) {
+    state.emit({ type: "session.config", sessionId: id, config: configState(session, state) });
+  }
 }
 
 function configureSession(
@@ -670,6 +703,27 @@ function configureSession(
       ? { ...session.config.settings, ...changes.settings }
       : session.config.settings,
   };
+  // ponytail: switching to a model probed as effortless — the host keeps the
+  // per-agent pill value, so drop it here (unless the user explicitly picked
+  // an effort in the same change) instead of failing the first turn
+  if (
+    changes.thinkingOption === undefined &&
+    changes.model !== undefined &&
+    changes.model !== null &&
+    state.noEffortModels.has(changes.model)
+  ) {
+    session.config = { ...session.config, thinkingOption: undefined };
+  }
+  // ponytail: user explicitly set an effort on a model we previously marked
+  // effortless — forget the mark so the flag is sent (and re-probed) again
+  if (
+    changes.thinkingOption !== undefined &&
+    changes.thinkingOption !== null &&
+    session.config.model &&
+    state.noEffortModels.delete(session.config.model)
+  ) {
+    state.cache.noEffortModels = [...state.noEffortModels];
+  }
   state.emit({ type: "session.config", sessionId: input.sessionId, config: configState(session, state) });
   state.emit({
     type: "session.commands",
@@ -696,9 +750,9 @@ function promptText(content: ProviderContent[]): { text: string; unsupported: st
   return { text, unsupported: [...unsupported] };
 }
 
-function flagsFor(session: Session): RunFlags {
+function flagsFor(session: Session, state?: ConnectionState): RunFlags {
   const settings = session.config.settings as Record<string, unknown>;
-  const effort = effortOf(session);
+  const effort = effortOf(session, state);
   return {
     model: session.config.model ?? undefined,
     effort,
@@ -875,9 +929,13 @@ function runAgentTurn(
     if (value !== undefined) env[key] = value;
   }
   Object.assign(env, session.config.env);
+  const baseFlags = flagsFor(session, state);
+  let attemptEffort = baseFlags.effort;
+  let retriedWithoutEffort = false;
+  const spawnArgs = () => buildArgs({ ...baseFlags, effort: attemptEffort }, text);
   let proc: Proc;
   try {
-    proc = state.spawn(commandFor(session, state), buildArgs(flagsFor(session), text), {
+    proc = state.spawn(commandFor(session, state), spawnArgs(), {
       cwd: session.config.cwd,
       env,
     });
@@ -1116,36 +1174,75 @@ function runAgentTurn(
     }
   };
 
-  proc.stdout?.on("data", onChunk);
-  proc.stderr?.on("data", (chunk) => {
-    stderr += chunk.toString();
-  });
-  proc.on("error", (error: unknown) => {
-    const message = error instanceof Error ? error.message : String(error);
-    state.log(`turn ${turnId} proc error: ${message}`);
-    const interrupted = session.active?.interrupted;
-    push({ type: "error", id: `error-${turnId}`, message: friendlySpawnError(message, state) });
-    finish(interrupted ? "canceled" : "failed", friendlySpawnError(message, state));
-  });
-  proc.on("close", (code) => {
-    if (finished) return;
-    const interrupted = session.active?.interrupted;
-    if (interrupted) {
+  const wireProc = (target: Proc) => {
+    target.stdout?.on("data", onChunk);
+    target.stderr?.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    target.on("error", (error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      state.log(`turn ${turnId} proc error: ${message}`);
+      const interrupted = session.active?.interrupted;
+      push({ type: "error", id: `error-${turnId}`, message: friendlySpawnError(message, state) });
+      finish(interrupted ? "canceled" : "failed", friendlySpawnError(message, state));
+    });
+    target.on("close", (code) => {
+      if (finished) return;
+      const interrupted = session.active?.interrupted;
+      if (interrupted) {
+        if (buffer.trim()) onChunk("\n");
+        finish("canceled");
+        return;
+      }
       if (buffer.trim()) onChunk("\n");
-      finish("canceled");
-      return;
-    }
-    if (buffer.trim()) onChunk("\n");
-    if (typeof code === "number" && code !== 0) {
-      const message = friendlyExitError(stderr, code, state);
-      state.log(`turn ${turnId} exited ${code}: ${truncate(stderr.trim(), 200) || "no stderr"}`);
-      finish("failed", message);
-    } else if (code === null || code === undefined) {
-      finish("canceled");
-    } else {
-      finish(assistantText ? "completed" : "failed", assistantText ? undefined : `No response from the CLI. ${binaryHint(state)}`);
-    }
-  });
+      if (typeof code === "number" && code !== 0) {
+        // ponytail: --effort came from a stale per-agent Thinking value or a
+        // model with no adjustable effort — one retry without the flag, same turn
+        if (attemptEffort && !retriedWithoutEffort && isEffortRejection(stderr)) {
+          retriedWithoutEffort = true;
+          attemptEffort = undefined;
+          // ponytail: drop the stale pill value so later turns skip --effort too
+          session.config = { ...session.config, thinkingOption: undefined };
+          // ponytail: remember the model as effortless — the pill is hidden
+          // for it from here on (per-model thinkingOptions) and --effort is
+          // never sent again, even across reconnects
+          if (session.config.model) {
+            state.noEffortModels.add(session.config.model);
+            state.cache.noEffortModels = [...state.noEffortModels];
+          }
+          refreshAllSessionsConfig(state);
+          state.log(`turn ${turnId} retrying without --effort (${truncate(stderr.trim(), 200)})`);
+          buffer = "";
+          stderr = "";
+          let retry: Proc;
+          try {
+            retry = state.spawn(commandFor(session, state), spawnArgs(), {
+              cwd: session.config.cwd,
+              env,
+            });
+          } catch (error) {
+            const message = friendlySpawnError(error instanceof Error ? error.message : String(error), state);
+            state.log(`turn ${turnId} retry spawn failed: ${message}`);
+            finish("failed", message);
+            return;
+          }
+          session.active = { turnId, proc: retry, interrupted: false };
+          proc = retry;
+          wireProc(retry);
+          return;
+        }
+        const message = friendlyExitError(stderr, code, state);
+        state.log(`turn ${turnId} exited ${code}: ${truncate(stderr.trim(), 200) || "no stderr"}`);
+        finish("failed", message);
+      } else if (code === null || code === undefined) {
+        finish("canceled");
+      } else {
+        finish(assistantText ? "completed" : "failed", assistantText ? undefined : `No response from the CLI. ${binaryHint(state)}`);
+      }
+    });
+  };
+
+  wireProc(proc);
 }
 
 function runCommand(
