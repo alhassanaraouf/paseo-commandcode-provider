@@ -1,6 +1,5 @@
 {
   "id": "commandcode-provider",
-  "description": "Paseo provider for the Command Code coding agent (headless via `commandcode -p`)",
   "requirements": {
     "paseo": ">=0.8.0"
   }
