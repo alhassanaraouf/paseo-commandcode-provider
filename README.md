@@ -14,7 +14,7 @@ To point at a different binary (a different alias, a full path, a wrapper script
 ## Install
 
 ```bash
-paseo plugin install npm:paseo-commandcode-provider
+paseo plugin install npm:@alhassanaraouf/paseo-commandcode-provider
 ```
 
 Or from GitHub:
