@@ -14,7 +14,7 @@ To point at a different binary (a different alias, a full path, a wrapper script
 ## Install
 
 ```bash
-paseo plugin install npm:@alhassanaraouf/paseo-commandcode-provider
+paseo plugin add npm:@alhassanaraouf/paseo-commandcode-provider
 ```
 
 Or from GitHub:
@@ -26,7 +26,7 @@ paseo plugin add alhassanaraouf/paseo-commandcode-provider
 Or from a local checkout:
 
 ```bash
-paseo plugin install /path/to/paseo-commandcode-provider
+paseo plugin add /path/to/paseo-commandcode-provider
 ```
 
 Then create an agent with the **Command Code** provider.
