@@ -2,10 +2,10 @@ import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { buildArgs, parseLine, parseTaskGet, parseTaskId, parseTaskList } from "./commandcode.js";
-import { createCommandcodeProvider, makeTitle, type Proc, type SpawnFn } from "./provider.js";
-import { listNativeSessions, readNativeTranscript } from "./sessions.js";
-import { parseSkillsList } from "./skills.js";
+import { buildArgs, parseLine, parseTaskGet, parseTaskId, parseTaskList } from "../server/commandcode.js";
+import { createCommandcodeProvider, makeTitle, type Proc, type SpawnFn } from "../server/provider.js";
+import { listNativeSessions, readNativeTranscript } from "../server/sessions.js";
+import { parseSkillsList } from "../server/skills.js";
 import type { ProviderEvent } from "@getpaseo/plugin/server/provider";
 
 function stream() {
