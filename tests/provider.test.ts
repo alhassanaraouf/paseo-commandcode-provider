@@ -838,6 +838,200 @@ describe("commandcode provider", () => {
     expect(makeTitle(undefined, "")).toBeUndefined();
   });
 
+  it("retries without --effort when the model rejects it", async () => {
+    const spawned: string[][] = [];
+    const procs: Array<ReturnType<typeof stream> & { stdout: ReturnType<typeof stream>; stderr: ReturnType<typeof stream> }> = [];
+    const fakeSpawn: SpawnFn = (_cmd, args) => {
+      spawned.push(args);
+      const stdout = stream();
+      const stderr = stream();
+      const procEvents = stream();
+      procs.push(Object.assign(procEvents, { stdout, stderr }));
+      return {
+        stdout: stdout as unknown as Proc["stdout"],
+        stderr: stderr as unknown as Proc["stderr"],
+        on: procEvents.on,
+        kill: () => {},
+      } as Proc;
+    };
+    const connection = await createCommandcodeProvider({
+      spawn: fakeSpawn,
+      listModels: () =>
+        Promise.resolve(["xiaomi/mimo-v2.6-flash  efficient flash", "fallback-model  fallback (default)"].join("\n")),
+      log: () => {},
+    }).connect({
+      versions: [1],
+      capabilities: ["prompt.message", "session.configure", "session.persistence"],
+    });
+    const events: ProviderEvent[] = [];
+    connection.onEvent((event) => events.push(event));
+    await connection.send({
+      type: "session.open",
+      requestId: "o1",
+      sessionId: "s1",
+      config: {
+        cwd: "/tmp",
+        env: {},
+        mcpServers: {},
+        settings: {},
+        persist: false,
+        model: "xiaomi/mimo-v2.6-flash",
+        thinkingOption: "medium",
+      },
+      history: "skip",
+    });
+    await tick();
+    await tick();
+    await tick();
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: {
+        clientMessageId: "m1",
+        delivery: "auto",
+        input: { type: "message", content: [{ type: "text", text: "hello" }] },
+      },
+    });
+    await tick();
+    expect(spawned[0]).toContain("--effort");
+    procs[0].stderr.emit("data", "MiMo V2.6 Flash has no adjustable reasoning effort.\n");
+    procs[0].emit("close", 1);
+    await tick();
+    await tick();
+    // ponytail: same turn retried flagless instead of failing
+    expect(spawned).toHaveLength(2);
+    expect(spawned[1]).not.toContain("--effort");
+    procs[1].stdout.emit(
+      "data",
+      '{"type":"event","event":{"type":"text_delta","delta":"hi there"}}\n' +
+        '{"type":"result","subtype":"success","sessionId":"native-1","finalText":"hi there"}\n',
+    );
+    procs[1].emit("close", 0);
+    await tick();
+    await tick();
+    const turnDone = events.find(
+      (event): event is Extract<ProviderEvent, { type: "session.turn" }> =>
+        event.type === "session.turn" && event.state === "completed",
+    );
+    expect(turnDone).toBeDefined();
+    // ponytail: stale pill cleared and model remembered as effortless
+    const configs = events.filter(
+      (event): event is Extract<ProviderEvent, { type: "session.config" }> => event.type === "session.config",
+    );
+    expect(configs.at(-1)?.config.thinkingOption).toBeUndefined();
+    expect(
+      configs.at(-1)?.config.models.find((m) => m.id === "xiaomi/mimo-v2.6-flash"),
+    ).toEqual(expect.objectContaining({ thinkingOptions: [] }));
+    await connection.close();
+  });
+
+  it("strips stale effort and hides the pill for effortless models", async () => {
+    const spawned: string[][] = [];
+    const procs: Array<ReturnType<typeof stream> & { stdout: ReturnType<typeof stream>; stderr: ReturnType<typeof stream> }> = [];
+    const fakeSpawn: SpawnFn = (_cmd, args) => {
+      spawned.push(args);
+      const stdout = stream();
+      const stderr = stream();
+      const procEvents = stream();
+      procs.push(Object.assign(procEvents, { stdout, stderr }));
+      return {
+        stdout: stdout as unknown as Proc["stdout"],
+        stderr: stderr as unknown as Proc["stderr"],
+        on: procEvents.on,
+        kill: () => {},
+      } as Proc;
+    };
+    const connection = await createCommandcodeProvider({
+      spawn: fakeSpawn,
+      listModels: () =>
+        Promise.resolve(["xiaomi/mimo-v2.6-flash  efficient flash", "foo/bar-model  other (default)"].join("\n")),
+      modelsCache: {
+        models: [],
+        defaultModel: undefined,
+        fetchedAt: 0,
+        noEffortModels: ["xiaomi/mimo-v2.6-flash"],
+      },
+      log: () => {},
+    }).connect({
+      versions: [1],
+      capabilities: ["prompt.message", "session.configure", "session.persistence"],
+    });
+    const events: ProviderEvent[] = [];
+    connection.onEvent((event) => events.push(event));
+    await connection.send({
+      type: "session.open",
+      requestId: "o1",
+      sessionId: "s1",
+      config: {
+        cwd: "/tmp",
+        env: {},
+        mcpServers: {},
+        settings: {},
+        persist: false,
+        model: "foo/bar-model",
+        thinkingOption: "medium",
+      },
+      history: "skip",
+    });
+    await tick();
+    await tick();
+    await tick();
+    // ponytail: switching to a probed-effortless model drops the stale pill
+    await connection.send({
+      type: "session.configure",
+      requestId: "g1",
+      sessionId: "s1",
+      changes: { model: "xiaomi/mimo-v2.6-flash" },
+    });
+    await tick();
+    const configs = events.filter(
+      (event): event is Extract<ProviderEvent, { type: "session.config" }> => event.type === "session.config",
+    );
+    expect(configs.at(-1)?.config.thinkingOption).toBeUndefined();
+    expect(
+      configs.at(-1)?.config.models.find((m) => m.id === "xiaomi/mimo-v2.6-flash"),
+    ).toEqual(expect.objectContaining({ thinkingOptions: [] }));
+    // ponytail: turns on the effortless model never send the flag
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: {
+        clientMessageId: "m1",
+        delivery: "auto",
+        input: { type: "message", content: [{ type: "text", text: "hello" }] },
+      },
+    });
+    await tick();
+    expect(spawned[0]).not.toContain("--effort");
+    procs[0].stdout.emit(
+      "data",
+      '{"type":"result","subtype":"success","sessionId":"native-1","finalText":"hi there"}\n',
+    );
+    procs[0].emit("close", 0);
+    await tick();
+    await tick();
+    // ponytail: explicitly picking an effort forgets the mark — flag is sent again
+    await connection.send({
+      type: "session.configure",
+      requestId: "g2",
+      sessionId: "s1",
+      changes: { thinkingOption: "medium" },
+    });
+    await tick();
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: {
+        clientMessageId: "m2",
+        delivery: "auto",
+        input: { type: "message", content: [{ type: "text", text: "again" }] },
+      },
+    });
+    await tick();
+    expect(spawned[1]).toContain("--effort");
+    await connection.close();
+  });
+
   it("persists tasks across reconnects", async () => {
     const stdout = stream();
     const stderr = stream();
