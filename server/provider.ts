@@ -130,9 +130,6 @@ interface HealthState {
 
 const HEALTH_TTL_MS = 5 * 60 * 1000;
 const MODELS_TTL_MS = 60 * 60 * 1000;
-const STREAM_FLUSH_MS = 100;
-const STREAM_FLUSH_CHARS = 500;
-
 const execFileAsync = promisify(nodeExecFile);
 
 async function runListModels(command: string): Promise<string> {
@@ -905,28 +902,29 @@ function runAgentTurn(
   >();
   let pendingAssistant = false;
   let pendingReasoning = false;
-  let lastFlush = 0;
-  const lastFlushLen = { assistant: 0, reasoning: 0 };
-  const flushStream = () => {
-    if (pendingReasoning) {
-      pendingReasoning = false;
-      lastFlushLen.reasoning = thinkingText.length;
-      push({ type: "reasoning", id: `reasoning-${turnId}`, text: thinkingText });
-    }
-    if (pendingAssistant) {
-      pendingAssistant = false;
-      lastFlushLen.assistant = assistantText.length;
-      push({ type: "assistant_message", id: `assistant-${turnId}`, text: assistantText });
-    }
-    lastFlush = Date.now();
+  let reasoningBlock = 0;
+  // The implicit block (thinking deltas before any thinking_start) owns id 0,
+  // so the first explicit block pre-increments to keep every id unique.
+  let reasoningId = `reasoning-${turnId}-${reasoningBlock}`;
+  // Paseo turns repeated provider snapshots into separate timeline deltas.
+  // Thinking flushes once per block (thinking_end), the assistant text once at
+  // the end of the run, so a later thinking/tool cycle cannot emit it early or
+  // fragment it. Tools keep streaming live.
+  const flushReasoning = () => {
+    if (!pendingReasoning) return;
+    pendingReasoning = false;
+    if (thinkingText) push({ type: "reasoning", id: reasoningId, text: thinkingText });
   };
-  const scheduleFlush = () => {
-    if (Date.now() - lastFlush >= STREAM_FLUSH_MS) flushStream();
+  const flushAssistant = () => {
+    if (!pendingAssistant) return;
+    pendingAssistant = false;
+    if (assistantText) push({ type: "assistant_message", id: `assistant-${turnId}`, text: assistantText });
   };
   const finish = (terminal: "completed" | "failed" | "canceled", error?: string) => {
     if (finished) return;
     finished = true;
-    flushStream();
+    flushReasoning();
+    flushAssistant();
     session.active = null;
     state.emit({
       type: "session.persistence",
@@ -953,34 +951,27 @@ function runAgentTurn(
             persistence: persistenceData(session),
           });
           break;
+        case "thinking_start":
+          if (pendingReasoning) flushReasoning();
+          reasoningId = `reasoning-${turnId}-${++reasoningBlock}`;
+          thinkingText = "";
+          break;
         case "thinking_delta":
           thinkingText += parsed.delta;
           pendingReasoning = true;
-          if (thinkingText.length - lastFlushLen.reasoning >= STREAM_FLUSH_CHARS) flushStream();
-          else scheduleFlush();
           break;
         case "thinking_end":
           thinkingText = parsed.text;
           pendingReasoning = true;
-          flushStream();
+          flushReasoning();
           break;
         case "text_delta":
           assistantText += parsed.delta;
           pendingAssistant = true;
-          if (assistantText.length - lastFlushLen.assistant >= STREAM_FLUSH_CHARS) flushStream();
-          else scheduleFlush();
           break;
         case "message_update":
-          if (parsed.thinking && parsed.thinking !== thinkingText) {
-            thinkingText = parsed.thinking;
-            pendingReasoning = true;
-            flushStream();
-          }
-          if (parsed.text && parsed.text !== assistantText) {
-            assistantText = parsed.text;
-            pendingAssistant = true;
-            flushStream();
-          }
+          // This is a cumulative state snapshot of content already delivered
+          // through the delta events, not another visible timeline item.
           break;
         case "tool_queued":
         case "tool_running": {

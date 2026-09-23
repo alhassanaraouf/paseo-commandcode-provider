@@ -6,7 +6,7 @@ import { buildArgs, parseLine, parseTaskGet, parseTaskId, parseTaskList } from "
 import { createCommandcodeProvider, makeTitle, type Proc, type SpawnFn } from "../server/provider.js";
 import { listNativeSessions, readNativeTranscript } from "../server/sessions.js";
 import { parseSkillsList } from "../server/skills.js";
-import type { ProviderEvent } from "@getpaseo/plugin/server/provider";
+import type { ProviderEvent, ProviderTimelineItem } from "@getpaseo/plugin/server/provider";
 
 function stream() {
   const listeners = new Map<string, Array<(...args: unknown[]) => void>>();
@@ -26,6 +26,7 @@ const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
 
 describe("commandcode provider", () => {
   it("parses NDJSON lines and builds headless args", () => {
+    expect(parseLine('{"type":"event","event":{"type":"thinking_start"}}').kind).toBe("thinking_start");
     expect(parseLine('{"type":"event","event":{"type":"text_delta","delta":"hi"}}').kind).toBe("text_delta");
     expect(parseLine("not json").kind).toBe("ignored");
     expect(buildArgs({ model: "m", effort: "high", resumeSessionId: "s1" }, "hello")).toEqual([
@@ -251,6 +252,231 @@ describe("commandcode provider", () => {
         event.type === "session.turn" && event.state === "completed",
     );
     expect(turnDone).toBeDefined();
+    await connection.close();
+  });
+
+  it("accumulates streamed thinking and text without rendering message snapshots", async () => {
+    const stdout = stream();
+    const stderr = stream();
+    const procEvents = stream();
+    const fakeSpawn: SpawnFn = () => ({
+      stdout: stdout as unknown as Proc["stdout"],
+      stderr: stderr as unknown as Proc["stderr"],
+      on: procEvents.on,
+      kill: () => {},
+    }) as Proc;
+    const connection = await createCommandcodeProvider({
+      spawn: fakeSpawn,
+      listModels: () => Promise.resolve("fallback-model  fallback (default)"),
+      log: () => {},
+    }).connect({
+      versions: [1],
+      capabilities: ["prompt.message", "session.configure", "session.persistence"],
+    });
+    const events: ProviderEvent[] = [];
+    connection.onEvent((event) => events.push(event));
+    await connection.send({
+      type: "session.open",
+      requestId: "o1",
+      sessionId: "s1",
+      config: { cwd: "/tmp", env: {}, mcpServers: {}, settings: {}, persist: false },
+      history: "skip",
+    });
+    await tick();
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: {
+        clientMessageId: "m1",
+        delivery: "auto",
+        input: { type: "message", content: [{ type: "text", text: "hello" }] },
+      },
+    });
+    await tick();
+
+    stdout.emit("data", [
+      { type: "event", event: { type: "thinking_start" } },
+      { type: "event", event: { type: "thinking_delta", delta: "check " } },
+      { type: "event", event: { type: "thinking_delta", delta: "the code" } },
+      { type: "event", event: { type: "thinking_end", text: "check the code" } },
+      { type: "event", event: { type: "text_delta", delta: "Fixed " } },
+      { type: "event", event: { type: "message_update", content: [{ type: "thinking", thinking: "check the code" }, { type: "text", text: "Fixed it." }] } },
+      { type: "event", event: { type: "tool_queued", toolCallId: "call-1", toolName: "read_file", input: { path: "a.ts" } } },
+      { type: "event", event: { type: "tool_completed", toolCallId: "call-1", toolName: "read_file", result: [{ type: "text", text: "contents" }] } },
+      { type: "event", event: { type: "text_delta", delta: "it." } },
+      { type: "result", sessionId: "native-1", finalText: "Fixed it." },
+    ].map((event) => JSON.stringify(event)).join("\n") + "\n");
+    procEvents.emit("close", 0);
+    await tick();
+
+    const timeline = events.filter(
+      (event): event is Extract<ProviderEvent, { type: "timeline.item" }> => event.type === "timeline.item",
+    );
+    const reasoning = timeline.filter((event) => event.item.type === "reasoning");
+    const assistant = timeline.filter((event) => event.item.type === "assistant_message");
+    expect(reasoning).toHaveLength(1);
+    expect(reasoning.at(-1)?.item).toMatchObject({ type: "reasoning", text: "check the code" });
+    expect(assistant).toHaveLength(1);
+    expect(assistant.at(-1)?.item).toMatchObject({ type: "assistant_message", text: "Fixed it." });
+    expect(timeline.filter((event) => event.item.type === "tool_call")).toHaveLength(2);
+    await connection.close();
+  });
+
+  async function startTurn() {
+    const stdout = stream();
+    const stderr = stream();
+    const procEvents = stream();
+    const connection = await createCommandcodeProvider({
+      spawn: () =>
+        ({
+          stdout: stdout as unknown as Proc["stdout"],
+          stderr: stderr as unknown as Proc["stderr"],
+          on: procEvents.on,
+          kill: () => {},
+        }) as Proc,
+      listModels: () => Promise.resolve("fallback-model  fallback (default)"),
+      log: () => {},
+    }).connect({
+      versions: [1],
+      capabilities: ["prompt.message", "session.configure", "session.persistence"],
+    });
+    const events: ProviderEvent[] = [];
+    connection.onEvent((event) => events.push(event));
+    await connection.send({
+      type: "session.open",
+      requestId: "o1",
+      sessionId: "s1",
+      config: { cwd: "/tmp", env: {}, mcpServers: {}, settings: {}, persist: false },
+      history: "skip",
+    });
+    await tick();
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: {
+        clientMessageId: "m1",
+        delivery: "auto",
+        input: { type: "message", content: [{ type: "text", text: "hello" }] },
+      },
+    });
+    await tick();
+    return { connection, events, stdout, procEvents };
+  }
+
+  function feed(target: ReturnType<typeof stream>, lines: unknown[]) {
+    target.emit("data", lines.map((line) => JSON.stringify(line)).join("\n") + "\n");
+  }
+
+  function timelineOf(events: ProviderEvent[]): ProviderTimelineItem[] {
+    return events
+      .filter(
+        (event): event is Extract<ProviderEvent, { type: "timeline.item" }> => event.type === "timeline.item",
+      )
+      .map((event) => event.item);
+  }
+
+  it("keeps buffered text until the run ends when a later thinking/tool cycle follows", async () => {
+    const { connection, events, stdout, procEvents } = await startTurn();
+
+    feed(stdout, [
+      { type: "event", event: { type: "text_delta", delta: "Fixed " } },
+      { type: "event", event: { type: "thinking_start" } },
+      { type: "event", event: { type: "thinking_delta", delta: "check the code" } },
+      { type: "event", event: { type: "thinking_end", text: "check the code" } },
+      { type: "event", event: { type: "message_update", content: [{ type: "text", text: "SNAPSHOT" }] } },
+      { type: "event", event: { type: "tool_queued", toolCallId: "call-1", toolName: "read_file", input: { path: "a.ts" } } },
+      { type: "event", event: { type: "tool_completed", toolCallId: "call-1", toolName: "read_file", result: [{ type: "text", text: "contents" }] } },
+    ]);
+    await tick();
+
+    const midRun = timelineOf(events);
+    expect(midRun.some((item) => item.type === "assistant_message")).toBe(false);
+    expect(midRun.filter((item) => item.type === "reasoning")).toHaveLength(1);
+    expect(midRun.filter((item) => item.type === "tool_call")).toHaveLength(2);
+
+    feed(stdout, [
+      { type: "event", event: { type: "text_delta", delta: "it." } },
+      { type: "result", sessionId: "native-1", finalText: "Fixed it." },
+    ]);
+    procEvents.emit("close", 0);
+    await tick();
+
+    const finished = timelineOf(events);
+    const assistant = finished.filter(
+      (item): item is Extract<ProviderTimelineItem, { type: "assistant_message" }> =>
+        item.type === "assistant_message",
+    );
+    expect(assistant).toHaveLength(1);
+    expect(assistant[0].id).toMatch(/^assistant-/);
+    expect(assistant[0].text).toBe("Fixed it.");
+    expect(finished.findIndex((item) => item.type === "assistant_message")).toBeGreaterThan(
+      finished.findLastIndex((item) => item.type === "tool_call"),
+    );
+    await connection.close();
+  });
+
+  it("emits each thinking block exactly once with unique ids", async () => {
+    const { connection, events, stdout, procEvents } = await startTurn();
+
+    feed(stdout, [
+      { type: "event", event: { type: "thinking_delta", delta: "draft " } },
+      { type: "event", event: { type: "thinking_delta", delta: "notes" } },
+      { type: "event", event: { type: "thinking_start" } },
+      { type: "event", event: { type: "thinking_delta", delta: "second" } },
+      { type: "event", event: { type: "thinking_end", text: "second" } },
+      { type: "event", event: { type: "thinking_start" } },
+      { type: "event", event: { type: "thinking_delta", delta: "third" } },
+      { type: "event", event: { type: "thinking_end", text: "third" } },
+      { type: "result", sessionId: "native-1", finalText: "done" },
+    ]);
+    procEvents.emit("close", 0);
+    await tick();
+
+    const reasoning = timelineOf(events).filter(
+      (item): item is Extract<ProviderTimelineItem, { type: "reasoning" }> => item.type === "reasoning",
+    );
+    expect(reasoning.map((item) => item.text)).toEqual(["draft notes", "second", "third"]);
+    expect(new Set(reasoning.map((item) => item.id)).size).toBe(reasoning.length);
+    await connection.close();
+  });
+
+  it("flushes buffered text once when a turn is canceled", async () => {
+    const { connection, events, stdout, procEvents } = await startTurn();
+
+    feed(stdout, [{ type: "event", event: { type: "text_delta", delta: "partial answer" } }]);
+    await tick();
+    await connection.send({ type: "session.interrupt", requestId: "i1", sessionId: "s1" });
+    await tick();
+    procEvents.emit("close", null);
+    await tick();
+
+    const assistant = timelineOf(events).filter(
+      (item): item is Extract<ProviderTimelineItem, { type: "assistant_message" }> =>
+        item.type === "assistant_message",
+    );
+    expect(assistant).toHaveLength(1);
+    expect(assistant[0].text).toBe("partial answer");
+    expect(
+      events.some((event) => event.type === "session.turn" && event.state === "canceled"),
+    ).toBe(true);
+    await connection.close();
+  });
+
+  it("flushes buffered text once when the run fails", async () => {
+    const { connection, events, stdout, procEvents } = await startTurn();
+
+    feed(stdout, [{ type: "event", event: { type: "text_delta", delta: "half" } }]);
+    await tick();
+    procEvents.emit("error", new Error("boom"));
+    await tick();
+
+    const assistant = timelineOf(events).filter(
+      (item): item is Extract<ProviderTimelineItem, { type: "assistant_message" }> =>
+        item.type === "assistant_message",
+    );
+    expect(assistant).toHaveLength(1);
+    expect(assistant[0].text).toBe("half");
+    expect(events.some((event) => event.type === "session.turn" && event.state === "failed")).toBe(true);
     await connection.close();
   });
 
