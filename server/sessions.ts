@@ -7,7 +7,8 @@ import type {
   ProviderTimelineItem,
   ProviderToolCallDetail,
 } from "@getpaseo/plugin/server/provider";
-import type { JsonValue } from "@getpaseo/protocol/agent-types";
+
+type UnknownToolInput = Extract<ProviderToolCallDetail, { type: "unknown" }>["input"];
 
 const MAX_TRANSCRIPT_BYTES = 5 * 1024 * 1024;
 const MAX_SUMMARY_LINES = 400;
@@ -216,7 +217,7 @@ export function toolDetail(
       return { type: "shell", command: stringField("command") ?? name, output: resultText, exitCode: null };
     }
   }
-  return { type: "unknown", input: rest as JsonValue, output: resultText ?? "" };
+  return { type: "unknown", input: rest as UnknownToolInput, output: resultText ?? "" };
 }
 
 /** Replay a native transcript file as provider timeline snapshots. */
