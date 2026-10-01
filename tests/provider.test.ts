@@ -1,8 +1,9 @@
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { buildArgs, parseLine, parseTaskGet, parseTaskId, parseTaskList } from "../server/commandcode.js";
+import { ImageMaterializer } from "../server/images.js";
 import { createCommandcodeProvider, makeTitle, type Proc, type SpawnFn } from "../server/provider.js";
 import { listNativeSessions, readNativeTranscript } from "../server/sessions.js";
 import { parseSkillsList } from "../server/skills.js";
@@ -170,6 +171,199 @@ describe("commandcode provider", () => {
     );
     expect(catalog?.catalog.models).toEqual([]);
     expect(catalog?.catalog.defaultModel).toBeUndefined();
+    await connection.close();
+  });
+
+  it("forwards images as a readable path instead of failing the prompt", async () => {
+    let spawnedArgs: string[] = [];
+    const stdout = stream();
+    const stderr = stream();
+    const procEvents = stream();
+    const fakeSpawn: SpawnFn = (_cmd, args) => {
+      spawnedArgs = args;
+      return {
+        stdout: stdout as unknown as Proc["stdout"],
+        stderr: stderr as unknown as Proc["stderr"],
+        on: procEvents.on,
+        kill: () => {},
+      } as Proc;
+    };
+    const home = mkdtempSync(join(tmpdir(), "paseo-home-"));
+    const images = new ImageMaterializer(16 * 1024 * 1024, { PASEO_HOME: home });
+    const connection = await createCommandcodeProvider({
+      spawn: fakeSpawn,
+      listModels: () => Promise.resolve(""),
+      images,
+      log: () => {},
+    }).connect({
+      versions: [1],
+      capabilities: [
+        "prompt.message",
+        "prompt.image",
+        "session.configure",
+        "session.persistence",
+      ],
+    });
+    const events: ProviderEvent[] = [];
+    connection.onEvent((event) => events.push(event));
+    await connection.send({
+      type: "session.open",
+      requestId: "o1",
+      sessionId: "s1",
+      config: { cwd: "/tmp", env: {}, mcpServers: {}, settings: {}, persist: false },
+      history: "skip",
+    });
+    await tick();
+
+    const image =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: {
+        clientMessageId: "m1",
+        delivery: "auto",
+        input: {
+          type: "message",
+          content: [
+            { type: "text", text: "what colour is this?" },
+            { type: "image", data: image, mimeType: "image/png" },
+          ],
+        },
+      },
+    });
+    await tick();
+
+    // the prompt must reach the CLI, with the image referenced by path
+    expect(spawnedArgs.some((arg) => arg.includes("what colour is this?"))).toBe(true);
+    const hint = spawnedArgs.find((arg) => arg.includes("[Image available at:"));
+    expect(hint).toBeDefined();
+    const file = hint?.match(/\[Image available at: (.+)]/)?.[1];
+    expect(file).toBeDefined();
+    expect(file?.endsWith(".png")).toBe(true);
+    // read_file resolves the path, so the bytes must really be on disk
+    expect(readFileSync(file as string).equals(Buffer.from(image, "base64"))).toBe(true);
+
+    stdout.emit(
+      "data",
+      '{"type":"result","subtype":"success","sessionId":"native-1","finalText":"red"}\n',
+    );
+    procEvents.emit("close", 0);
+    await tick();
+    await tick();
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "session.prompt_result",
+        clientMessageId: "m1",
+        result: expect.objectContaining({ type: "turn" }),
+      }),
+    );
+    await connection.close();
+    // closing the connection reaps the attachment directory
+    expect(existsSync(file as string)).toBe(false);
+  });
+
+  it("keeps the turn alive and warns when an image cannot be materialized", async () => {
+    let spawnedArgs: string[] = [];
+    const stdout = stream();
+    const stderr = stream();
+    const procEvents = stream();
+    const fakeSpawn: SpawnFn = (_cmd, args) => {
+      spawnedArgs = args;
+      return {
+        stdout: stdout as unknown as Proc["stdout"],
+        stderr: stderr as unknown as Proc["stderr"],
+        on: procEvents.on,
+        kill: () => {},
+      } as Proc;
+    };
+    const home = mkdtempSync(join(tmpdir(), "paseo-home-"));
+    // a 16-byte budget rejects any real image
+    const images = new ImageMaterializer(16, { PASEO_HOME: home });
+    const connection = await createCommandcodeProvider({
+      spawn: fakeSpawn,
+      listModels: () => Promise.resolve(""),
+      images,
+      log: () => {},
+    }).connect({
+      versions: [1],
+      capabilities: ["prompt.message", "prompt.image", "session.configure", "session.persistence"],
+    });
+    const events: ProviderEvent[] = [];
+    connection.onEvent((event) => events.push(event));
+    await connection.send({
+      type: "session.open",
+      requestId: "o1",
+      sessionId: "s1",
+      config: { cwd: "/tmp", env: {}, mcpServers: {}, settings: {}, persist: false },
+      history: "skip",
+    });
+    await tick();
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: {
+        clientMessageId: "m1",
+        delivery: "auto",
+        input: {
+          type: "message",
+          content: [
+            { type: "text", text: "look" },
+            {
+              type: "image",
+              data:
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+              mimeType: "image/png",
+            },
+          ],
+        },
+      },
+    });
+    await tick();
+
+    // the text still runs; the image degrades to a warning rather than a failure
+    expect(spawnedArgs.some((arg) => arg.includes("look"))).toBe(true);
+    expect(spawnedArgs.some((arg) => arg.includes("[Image available at:"))).toBe(false);
+    const notification = events.find(
+      (event): event is Extract<ProviderEvent, { type: "timeline.item" }> =>
+        event.type === "timeline.item" && event.item.type === "notification",
+    );
+    expect(notification?.item.type === "notification" ? notification.item.message : "").toContain(
+      "Image not forwarded",
+    );
+    await connection.close();
+  });
+
+  it("advertises prompt.image on the connection and on session.opened", async () => {
+    const connection = await createCommandcodeProvider({
+      spawn: () => {
+        throw new Error("no spawn in capability test");
+      },
+      listModels: () => Promise.resolve(""),
+      log: () => {},
+    }).connect({
+      versions: [1],
+      capabilities: ["prompt.message", "prompt.image", "session.configure", "session.persistence"],
+    });
+    // without this the host rejects any image prompt with
+    // "Provider does not support prompt.image" before the provider sees it
+    expect(connection.capabilities).toContain("prompt.image");
+
+    const events: ProviderEvent[] = [];
+    connection.onEvent((event) => events.push(event));
+    await connection.send({
+      type: "session.open",
+      requestId: "o1",
+      sessionId: "s1",
+      config: { cwd: "/tmp", env: {}, mcpServers: {}, settings: {}, persist: false },
+      history: "skip",
+    });
+    await tick();
+    const opened = events.find(
+      (event): event is Extract<ProviderEvent, { type: "session.opened" }> =>
+        event.type === "session.opened",
+    );
+    expect(opened?.capabilities).toContain("prompt.image");
     await connection.close();
   });
 

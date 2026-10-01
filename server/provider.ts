@@ -17,6 +17,7 @@ import {
 } from "@getpaseo/plugin/server/provider";
 import { buildArgs, parseLine, parseTaskGet, parseTaskId, parseTaskList, type RunFlags } from "./commandcode.js";
 import { commandArgv, COMMANDS, findCommand } from "./commands.js";
+import { ImageMaterializer } from "./images.js";
 import { parseListModels, type ModelInfo } from "./models.js";
 import { listNativeSessions, readNativeTranscript, toolDetail } from "./sessions.js";
 import { parseSkillsList, type SkillInfo } from "./skills.js";
@@ -26,6 +27,16 @@ import { CLI_DEFAULTS, cliSettings } from "../shared/settings.js";
 const CAPABILITIES = [
   "prompt.message",
   "prompt.command",
+  "prompt.image",
+  "session.configure",
+  "session.list",
+  "session.persistence",
+] as const;
+
+const SESSION_CAPABILITIES = [
+  "prompt.message",
+  "prompt.command",
+  "prompt.image",
   "session.configure",
   "session.list",
   "session.persistence",
@@ -122,6 +133,7 @@ interface ConnectionState {
   noEffortModels: Set<string>;
   skills: Map<string, SkillInfo>;
   skillsFetchedAt: number;
+  images: ImageMaterializer;
 }
 
 interface HealthState {
@@ -176,6 +188,8 @@ export function createCommandcodeProvider(options?: {
   listModels?: () => Promise<string>;
   listSkills?: () => Promise<string>;
   modelsCache?: ModelsCache;
+  /** Overridable for tests; defaults to a PASEO_HOME-backed materializer. */
+  images?: ImageMaterializer;
   log?: (message: string) => void;
 }): ProviderRegistration {
   return {
@@ -205,6 +219,7 @@ export function createCommandcodeProvider(options?: {
         listModels: options?.listModels ?? (() => runListModels(command)),
         listSkills: options?.listSkills ?? (() => runListSkills(command)),
         cache: options?.modelsCache ?? createModelsCache(),
+        images: options?.images,
       });
     },
   };
@@ -221,6 +236,8 @@ function createConnection(
     listModels: () => Promise<string>;
     listSkills: () => Promise<string>;
     cache: ModelsCache;
+    /** Overridable for tests; defaults to a PASEO_HOME-backed materializer. */
+    images?: ImageMaterializer;
   },
 ): ProviderConnection {
   const listeners = new Set<(event: ProviderEvent) => void>();
@@ -250,6 +267,7 @@ function createConnection(
     noEffortModels: new Set(options.cache.noEffortModels ?? []),
     skills: new Map(),
     skillsFetchedAt: 0,
+    images: options.images ?? new ImageMaterializer(),
   };
 
   return {
@@ -278,6 +296,7 @@ function createConnection(
       for (const session of sessions.values()) session.active?.proc.kill();
       sessions.clear();
       listeners.clear();
+      state.images.clear();
     },
   };
 }
@@ -555,7 +574,7 @@ function openSession(
     type: "session.opened",
     requestId: input.requestId,
     sessionId: input.sessionId,
-    capabilities: ["prompt.message", "prompt.command", "session.configure", "session.list", "session.persistence"],
+    capabilities: [...SESSION_CAPABILITIES],
     restoration: "core",
     ...(session.nativeSessionId || session.tasks.size > 0 ? { persistence: persistenceData(session) } : {}),
     title: input.config.title,
@@ -730,13 +749,23 @@ function configureSession(
   state.emit({ type: "request.completed", requestId: input.requestId });
 }
 
-function promptText(content: ProviderContent[]): { text: string; unsupported: string[] } {
+function promptText(
+  content: ProviderContent[],
+  images: ImageMaterializer,
+): { text: string; unsupported: string[] } {
   let text = "";
   const unsupported = new Set<string>();
   for (const part of content) {
     if (part.type === "text") text += (text ? "\n" : "") + part.text;
     else if (part.type === "image") {
-      unsupported.add("Images are not supported by the headless CLI");
+      // read_file attaches an image by absolute path, so the model still sees it
+      try {
+        text += (text ? "\n" : "") + `[Image available at: ${images.materialize(part)}]`;
+      } catch (error) {
+        unsupported.add(
+          `Image not forwarded (${error instanceof Error ? error.message : String(error)})`,
+        );
+      }
     } else if (part.type === "uploaded_file") {
       text += (text ? "\n" : "") + `[Attached file: ${part.fileName} (${part.path})]`;
       unsupported.add("File contents aren't forwarded — reference the file by path instead");
@@ -784,7 +813,7 @@ function promptSession(
     runSlashCommand(input.sessionId, session, input.prompt.clientMessageId, input.prompt.input.name, input.prompt.input.arguments, state);
     return;
   }
-  const { text, unsupported } = promptText(input.prompt.input.content);
+  const { text, unsupported } = promptText(input.prompt.input.content, state.images);
   if (!text.trim()) {
     fail(["Empty prompt", ...unsupported].join(". "));
     return;
@@ -899,7 +928,7 @@ function runAgentTurn(
       state.emit({
         type: "session.opened",
         sessionId,
-        capabilities: ["prompt.message", "prompt.command", "session.configure", "session.list", "session.persistence"],
+capabilities: [...SESSION_CAPABILITIES],
         restoration: "core",
         persistence: persistenceData(session),
         title: session.titleFromPrompt || undefined,
