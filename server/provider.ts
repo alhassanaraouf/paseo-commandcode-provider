@@ -1004,19 +1004,14 @@ capabilities: [...SESSION_CAPABILITIES],
     pendingReasoning = false;
     if (thinkingText) push({ type: "reasoning", id: reasoningId, text: thinkingText });
   };
-  let flushedAssistant = "";
   const flushAssistant = () => {
     if (!pendingAssistant) return;
     pendingAssistant = false;
-    // Emit only what the host has not seen for this id: mapTimelineItem slices
-    // the prefix itself, but sending the whole buffer again would re-transmit
-    // every earlier paragraph on each flush.
-    const delta = assistantText.startsWith(flushedAssistant)
-      ? assistantText.slice(flushedAssistant.length)
-      : assistantText;
-    if (!delta) return;
-    flushedAssistant = assistantText;
-    push({ type: "assistant_message", id: `assistant-${turnId}`, text: delta });
+    // The buffer must be sent cumulatively: mapTimelineItem slices off whatever
+    // prefix it already holds for this id. Sending only the new part breaks it
+    // whenever a fresh delta happens to start with the previous one ("ok" then
+    // "okay"), which the host reads as a repeat and drops.
+    if (assistantText) push({ type: "assistant_message", id: `assistant-${turnId}`, text: assistantText });
   };
   // Text that arrived before a tool call belongs above that call, so flush the
   // pending buffers first — otherwise the paragraph lands after the result it

@@ -436,15 +436,48 @@ describe("commandcode provider", () => {
         item.type === "assistant_message" ? `text:${item.text}` : `tool:${item.callId ?? item.id}`,
       );
 
+    // The host slices the prefix it already holds per id, so each flush carries
+    // the whole buffer and the visible text is the growing suffix.
     expect(timeline).toEqual([
       "text:First I check the config.\n\n",
       "tool:c1",
       "tool:c1",
-      "text:Now I run the tests.\n\n",
+      "text:First I check the config.\n\nNow I run the tests.\n\n",
       "tool:c2",
       "tool:c2",
-      "text:All done, everything passes.",
+      "text:First I check the config.\n\nNow I run the tests.\n\nAll done, everything passes.",
     ]);
+    await connection.close();
+  });
+
+  it("emits cumulative text so a delta that re-prefixes the previous one is not dropped", async () => {
+    const { connection, events, stdout, procEvents } = await startTurn();
+
+    feed(stdout, [
+      { type: "event", event: { type: "text_delta", delta: "ok" } },
+      { type: "event", event: { type: "tool_queued", toolCallId: "c1", toolName: "read_file", input: { path: "a.ts" } } },
+      // starts with the text the host already holds, so a delta-only emission
+      // would be read as a repeat and dropped
+      { type: "event", event: { type: "tool_completed", toolCallId: "c1", toolName: "read_file", result: [{ type: "text", text: "x" }] } },
+      { type: "event", event: { type: "text_delta", delta: "okay then" } },
+      { type: "result", sessionId: "native-1", finalText: "okokay then" },
+    ]);
+    procEvents.emit("close", 0);
+    await tick();
+
+    const assistant = timelineOf(events).filter(
+      (item): item is Extract<ProviderTimelineItem, { type: "assistant_message" }> =>
+        item.type === "assistant_message",
+    );
+    // what the host renders: mapTimelineItem slices the prefix it already saw
+    let previous = "";
+    let rendered = "";
+    for (const item of assistant) {
+      const text = item.text.startsWith(previous) ? item.text.slice(previous.length) : item.text;
+      if (text.length > 0) rendered += text;
+      previous = item.text;
+    }
+    expect(rendered).toBe("okokay then");
     await connection.close();
   });
 
@@ -592,11 +625,11 @@ describe("commandcode provider", () => {
     expect(reasoning).toHaveLength(1);
     expect(reasoning.at(-1)?.item).toMatchObject({ type: "reasoning", text: "check the code" });
     // "Fixed " flushes above the tool call and "it." above the completion, so the
-    // paragraphs land where they were streamed. Same id + prefix text means the
-    // host stitches them back into one message.
+    // paragraphs land where they were streamed. Cumulative text under one id
+    // means the host slices the prefix and shows the growing suffix.
     expect(assistant.map((event) => event.item.type === "assistant_message" && event.item.text)).toEqual([
       "Fixed ",
-      "it.",
+      "Fixed it.",
     ]);
     expect(new Set(assistant.map((event) => event.item.id)).size).toBe(1);
     expect(timeline.filter((event) => event.item.type === "tool_call")).toHaveLength(2);
@@ -692,11 +725,10 @@ describe("commandcode provider", () => {
       (item): item is Extract<ProviderTimelineItem, { type: "assistant_message" }> =>
         item.type === "assistant_message",
     );
-    // two flushes under one id, each carrying only the new text
-    expect(assistant.map((item) => item.text)).toEqual(["Fixed ", "it."]);
+    // two flushes under one id, each carrying the cumulative buffer
+    expect(assistant.map((item) => item.text)).toEqual(["Fixed ", "Fixed it."]);
     expect(assistant[0].id).toMatch(/^assistant-/);
     expect(new Set(assistant.map((item) => item.id)).size).toBe(1);
-    expect(assistant.map((item) => item.text).join("")).toBe("Fixed it.");
     expect(finished.findLastIndex((item) => item.type === "assistant_message")).toBeGreaterThan(
       finished.findLastIndex((item) => item.type === "tool_call"),
     );
