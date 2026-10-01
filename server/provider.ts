@@ -993,19 +993,37 @@ capabilities: [...SESSION_CAPABILITIES],
   // The implicit block (thinking deltas before any thinking_start) owns id 0,
   // so the first explicit block pre-increments to keep every id unique.
   let reasoningId = `reasoning-${turnId}-${reasoningBlock}`;
-  // Paseo turns repeated provider snapshots into separate timeline deltas.
-  // Thinking flushes once per block (thinking_end), the assistant text once at
-  // the end of the run, so a later thinking/tool cycle cannot emit it early or
-  // fragment it. Tools keep streaming live.
+  // Paseo turns repeated provider snapshots into separate timeline deltas:
+  // mapTimelineItem slices off the text it already saw for the same id. So a
+  // cumulative buffer is safe to re-emit, and must be — flushing text only at
+  // the end of the run moves every paragraph after the tool calls it preceded,
+  // which reads as one solid list of tools followed by one summary.
+  // Thinking keeps a per-block id and flushes at thinking_end.
   const flushReasoning = () => {
     if (!pendingReasoning) return;
     pendingReasoning = false;
     if (thinkingText) push({ type: "reasoning", id: reasoningId, text: thinkingText });
   };
+  let flushedAssistant = "";
   const flushAssistant = () => {
     if (!pendingAssistant) return;
     pendingAssistant = false;
-    if (assistantText) push({ type: "assistant_message", id: `assistant-${turnId}`, text: assistantText });
+    // Emit only what the host has not seen for this id: mapTimelineItem slices
+    // the prefix itself, but sending the whole buffer again would re-transmit
+    // every earlier paragraph on each flush.
+    const delta = assistantText.startsWith(flushedAssistant)
+      ? assistantText.slice(flushedAssistant.length)
+      : assistantText;
+    if (!delta) return;
+    flushedAssistant = assistantText;
+    push({ type: "assistant_message", id: `assistant-${turnId}`, text: delta });
+  };
+  // Text that arrived before a tool call belongs above that call, so flush the
+  // pending buffers first — otherwise the paragraph lands after the result it
+  // was reacting to.
+  const flushBeforeTool = () => {
+    flushReasoning();
+    flushAssistant();
   };
   const finish = (terminal: "completed" | "failed" | "canceled", error?: string) => {
     if (finished) return;
@@ -1062,6 +1080,7 @@ capabilities: [...SESSION_CAPABILITIES],
           break;
         case "tool_queued":
         case "tool_running": {
+          flushBeforeTool();
           const existing = tools.get(parsed.toolCallId) ?? {
             name: parsed.toolName,
             input: parsed.kind === "tool_queued" ? parsed.input : {},

@@ -367,6 +367,87 @@ describe("commandcode provider", () => {
     await connection.close();
   });
 
+  it("interleaves assistant text with tool calls in stream order", async () => {
+    const stdout = stream();
+    const stderr = stream();
+    const procEvents = stream();
+    const fakeSpawn: SpawnFn = () => {
+      return {
+        stdout: stdout as unknown as Proc["stdout"],
+        stderr: stderr as unknown as Proc["stderr"],
+        on: procEvents.on,
+        kill: () => {},
+      } as Proc;
+    };
+    const connection = await createCommandcodeProvider({
+      spawn: fakeSpawn,
+      listModels: () => Promise.resolve(""),
+      log: () => {},
+    }).connect({
+      versions: [1],
+      capabilities: ["prompt.message", "prompt.image", "session.configure", "session.persistence"],
+    });
+    const events: ProviderEvent[] = [];
+    connection.onEvent((event) => events.push(event));
+    await connection.send({
+      type: "session.open",
+      requestId: "o1",
+      sessionId: "s1",
+      config: { cwd: "/tmp", env: {}, mcpServers: {}, settings: {}, persist: false },
+      history: "skip",
+    });
+    await tick();
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: {
+        clientMessageId: "m1",
+        delivery: "auto",
+        input: { type: "message", content: [{ type: "text", text: "do the thing" }] },
+      },
+    });
+    await tick();
+
+    // text, then a tool, then more text, then another tool, then a summary:
+    // the timeline must preserve exactly this order
+    stdout.emit(
+      "data",
+      '{"type":"event","event":{"type":"run_start","sessionId":"native-1"}}\n' +
+        '{"type":"event","event":{"type":"text_delta","delta":"First I check the config.\\n\\n"}}\n' +
+        '{"type":"event","event":{"type":"tool_queued","toolCallId":"c1","toolName":"read_file","input":{"file_path":"a.ts"}}}\n' +
+        '{"type":"event","event":{"type":"tool_completed","toolCallId":"c1","toolName":"read_file","result":[{"type":"text","text":"contents"}]}}\n' +
+        '{"type":"event","event":{"type":"text_delta","delta":"Now I run the tests.\\n\\n"}}\n' +
+        '{"type":"event","event":{"type":"tool_queued","toolCallId":"c2","toolName":"shell","input":{"command":"npm test"}}}\n' +
+        '{"type":"event","event":{"type":"tool_completed","toolCallId":"c2","toolName":"shell","result":[{"type":"text","text":"ok"}]}}\n' +
+        '{"type":"event","event":{"type":"text_delta","delta":"All done, everything passes."}}\n' +
+        '{"type":"result","subtype":"success","sessionId":"native-1","finalText":"All done, everything passes."}\n',
+    );
+    procEvents.emit("close", 0);
+    await tick();
+    await tick();
+
+    const timeline = events
+      .filter((event): event is Extract<ProviderEvent, { type: "timeline.item" }> =>
+        event.type === "timeline.item",
+      )
+      .map((event) => event.item)
+      .filter((item) => item.type === "assistant_message" || item.type === "tool_call")
+      .map((item) =>
+        item.type === "assistant_message" ? `text:${item.text}` : `tool:${item.callId ?? item.id}`,
+      );
+
+    expect(timeline).toEqual([
+      "text:First I check the config.\n\n",
+      "tool:c1",
+      "tool:c1",
+      "text:Now I run the tests.\n\n",
+      "tool:c2",
+      "tool:c2",
+      "text:All done, everything passes.",
+    ]);
+    await connection.close();
+  });
+
   it("runs a prompt lifecycle against a fake commandcode", async () => {
     let spawnedArgs: string[] = [];
     const stdout = stream();
@@ -510,8 +591,14 @@ describe("commandcode provider", () => {
     const assistant = timeline.filter((event) => event.item.type === "assistant_message");
     expect(reasoning).toHaveLength(1);
     expect(reasoning.at(-1)?.item).toMatchObject({ type: "reasoning", text: "check the code" });
-    expect(assistant).toHaveLength(1);
-    expect(assistant.at(-1)?.item).toMatchObject({ type: "assistant_message", text: "Fixed it." });
+    // "Fixed " flushes above the tool call and "it." above the completion, so the
+    // paragraphs land where they were streamed. Same id + prefix text means the
+    // host stitches them back into one message.
+    expect(assistant.map((event) => event.item.type === "assistant_message" && event.item.text)).toEqual([
+      "Fixed ",
+      "it.",
+    ]);
+    expect(new Set(assistant.map((event) => event.item.id)).size).toBe(1);
     expect(timeline.filter((event) => event.item.type === "tool_call")).toHaveLength(2);
     await connection.close();
   });
@@ -569,7 +656,7 @@ describe("commandcode provider", () => {
       .map((event) => event.item);
   }
 
-  it("keeps buffered text until the run ends when a later thinking/tool cycle follows", async () => {
+  it("flushes text above the tool call it preceded, not at the end of the run", async () => {
     const { connection, events, stdout, procEvents } = await startTurn();
 
     feed(stdout, [
@@ -583,8 +670,13 @@ describe("commandcode provider", () => {
     ]);
     await tick();
 
+    // the paragraph streamed before read_file must already be on the timeline,
+    // above the call, or it reads as a summary of work the user has not seen yet
     const midRun = timelineOf(events);
-    expect(midRun.some((item) => item.type === "assistant_message")).toBe(false);
+    const textIndex = midRun.findIndex((item) => item.type === "assistant_message");
+    const toolIndex = midRun.findIndex((item) => item.type === "tool_call");
+    expect(textIndex).toBeGreaterThanOrEqual(0);
+    expect(toolIndex).toBeGreaterThan(textIndex);
     expect(midRun.filter((item) => item.type === "reasoning")).toHaveLength(1);
     expect(midRun.filter((item) => item.type === "tool_call")).toHaveLength(2);
 
@@ -600,10 +692,12 @@ describe("commandcode provider", () => {
       (item): item is Extract<ProviderTimelineItem, { type: "assistant_message" }> =>
         item.type === "assistant_message",
     );
-    expect(assistant).toHaveLength(1);
+    // two flushes under one id, each carrying only the new text
+    expect(assistant.map((item) => item.text)).toEqual(["Fixed ", "it."]);
     expect(assistant[0].id).toMatch(/^assistant-/);
-    expect(assistant[0].text).toBe("Fixed it.");
-    expect(finished.findIndex((item) => item.type === "assistant_message")).toBeGreaterThan(
+    expect(new Set(assistant.map((item) => item.id)).size).toBe(1);
+    expect(assistant.map((item) => item.text).join("")).toBe("Fixed it.");
+    expect(finished.findLastIndex((item) => item.type === "assistant_message")).toBeGreaterThan(
       finished.findLastIndex((item) => item.type === "tool_call"),
     );
     await connection.close();
