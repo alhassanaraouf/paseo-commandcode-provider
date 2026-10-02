@@ -17,6 +17,7 @@ import {
 } from "@getpaseo/plugin/server/provider";
 import { buildArgs, parseLine, parseTaskGet, parseTaskId, parseTaskList, type RunFlags } from "./commandcode.js";
 import { commandArgv, COMMANDS, findCommand } from "./commands.js";
+import { ImageMaterializer } from "./images.js";
 import { parseListModels, type ModelInfo } from "./models.js";
 import { listNativeSessions, readNativeTranscript, toolDetail } from "./sessions.js";
 import { parseSkillsList, type SkillInfo } from "./skills.js";
@@ -26,6 +27,16 @@ import { CLI_DEFAULTS, cliSettings } from "../shared/settings.js";
 const CAPABILITIES = [
   "prompt.message",
   "prompt.command",
+  "prompt.image",
+  "session.configure",
+  "session.list",
+  "session.persistence",
+] as const;
+
+const SESSION_CAPABILITIES = [
+  "prompt.message",
+  "prompt.command",
+  "prompt.image",
   "session.configure",
   "session.list",
   "session.persistence",
@@ -122,6 +133,7 @@ interface ConnectionState {
   noEffortModels: Set<string>;
   skills: Map<string, SkillInfo>;
   skillsFetchedAt: number;
+  images: ImageMaterializer;
 }
 
 interface HealthState {
@@ -176,6 +188,8 @@ export function createCommandcodeProvider(options?: {
   listModels?: () => Promise<string>;
   listSkills?: () => Promise<string>;
   modelsCache?: ModelsCache;
+  /** Overridable for tests; defaults to a PASEO_HOME-backed materializer. */
+  images?: ImageMaterializer;
   log?: (message: string) => void;
 }): ProviderRegistration {
   return {
@@ -205,6 +219,7 @@ export function createCommandcodeProvider(options?: {
         listModels: options?.listModels ?? (() => runListModels(command)),
         listSkills: options?.listSkills ?? (() => runListSkills(command)),
         cache: options?.modelsCache ?? createModelsCache(),
+        images: options?.images,
       });
     },
   };
@@ -221,6 +236,8 @@ function createConnection(
     listModels: () => Promise<string>;
     listSkills: () => Promise<string>;
     cache: ModelsCache;
+    /** Overridable for tests; defaults to a PASEO_HOME-backed materializer. */
+    images?: ImageMaterializer;
   },
 ): ProviderConnection {
   const listeners = new Set<(event: ProviderEvent) => void>();
@@ -250,6 +267,7 @@ function createConnection(
     noEffortModels: new Set(options.cache.noEffortModels ?? []),
     skills: new Map(),
     skillsFetchedAt: 0,
+    images: options.images ?? new ImageMaterializer(),
   };
 
   return {
@@ -278,6 +296,7 @@ function createConnection(
       for (const session of sessions.values()) session.active?.proc.kill();
       sessions.clear();
       listeners.clear();
+      state.images.clear();
     },
   };
 }
@@ -555,7 +574,7 @@ function openSession(
     type: "session.opened",
     requestId: input.requestId,
     sessionId: input.sessionId,
-    capabilities: ["prompt.message", "prompt.command", "session.configure", "session.list", "session.persistence"],
+    capabilities: [...SESSION_CAPABILITIES],
     restoration: "core",
     ...(session.nativeSessionId || session.tasks.size > 0 ? { persistence: persistenceData(session) } : {}),
     title: input.config.title,
@@ -730,13 +749,26 @@ function configureSession(
   state.emit({ type: "request.completed", requestId: input.requestId });
 }
 
-function promptText(content: ProviderContent[]): { text: string; unsupported: string[] } {
+function promptText(
+  content: ProviderContent[],
+  images: ImageMaterializer,
+): { text: string; unsupported: string[]; attachments: string[] } {
   let text = "";
   const unsupported = new Set<string>();
+  const attachments: string[] = [];
   for (const part of content) {
     if (part.type === "text") text += (text ? "\n" : "") + part.text;
     else if (part.type === "image") {
-      unsupported.add("Images are not supported by the headless CLI");
+      // read_file attaches an image by absolute path, so the model still sees it
+      try {
+        const file = images.materialize(part);
+        attachments.push(file);
+        text += (text ? "\n" : "") + `[Image available at: ${file}]`;
+      } catch (error) {
+        unsupported.add(
+          `Image not forwarded (${error instanceof Error ? error.message : String(error)})`,
+        );
+      }
     } else if (part.type === "uploaded_file") {
       text += (text ? "\n" : "") + `[Attached file: ${part.fileName} (${part.path})]`;
       unsupported.add("File contents aren't forwarded — reference the file by path instead");
@@ -744,7 +776,7 @@ function promptText(content: ProviderContent[]): { text: string; unsupported: st
       unsupported.add(`Attachments of type "${part.type}" are not forwarded`);
     }
   }
-  return { text, unsupported: [...unsupported] };
+  return { text, unsupported: [...unsupported], attachments };
 }
 
 function flagsFor(session: Session, state?: ConnectionState): RunFlags {
@@ -784,7 +816,7 @@ function promptSession(
     runSlashCommand(input.sessionId, session, input.prompt.clientMessageId, input.prompt.input.name, input.prompt.input.arguments, state);
     return;
   }
-  const { text, unsupported } = promptText(input.prompt.input.content);
+  const { text, unsupported, attachments } = promptText(input.prompt.input.content, state.images);
   if (!text.trim()) {
     fail(["Empty prompt", ...unsupported].join(". "));
     return;
@@ -805,7 +837,10 @@ function promptSession(
       });
     }
   }
-  runAgentTurn(input.sessionId, session, input.prompt.clientMessageId, text, state);
+  // Materialized images live in a temp root the CLI auto-allows reads from, so
+  // they are scoped to this turn rather than to the connection: macOS reaps
+  // /tmp after ~3 days, and a per-turn lifetime makes that unreachable.
+  runAgentTurn(input.sessionId, session, input.prompt.clientMessageId, text, state, attachments);
 }
 
 function runSlashCommand(
@@ -853,6 +888,8 @@ function runAgentTurn(
   clientMessageId: string,
   text: string,
   state: ConnectionState,
+  /** Image files this turn materialized, released once the turn ends. */
+  attachments: string[] = [],
 ): void {
   const fail = (message: string) => {
     state.emit({
@@ -864,6 +901,7 @@ function runAgentTurn(
   };
   if (session.active) {
     fail("A turn is already running");
+    state.images.release(attachments);
     return;
   }
 
@@ -899,7 +937,7 @@ function runAgentTurn(
       state.emit({
         type: "session.opened",
         sessionId,
-        capabilities: ["prompt.message", "prompt.command", "session.configure", "session.list", "session.persistence"],
+capabilities: [...SESSION_CAPABILITIES],
         restoration: "core",
         persistence: persistenceData(session),
         title: session.titleFromPrompt || undefined,
@@ -945,6 +983,7 @@ function runAgentTurn(
       state: "failed",
       error: { message: friendlySpawnError(error, state) },
     });
+    state.images.release(attachments);
     return;
   }
   session.active = { turnId, proc, interrupted: false };
@@ -964,10 +1003,12 @@ function runAgentTurn(
   // The implicit block (thinking deltas before any thinking_start) owns id 0,
   // so the first explicit block pre-increments to keep every id unique.
   let reasoningId = `reasoning-${turnId}-${reasoningBlock}`;
-  // Paseo turns repeated provider snapshots into separate timeline deltas.
-  // Thinking flushes once per block (thinking_end), the assistant text once at
-  // the end of the run, so a later thinking/tool cycle cannot emit it early or
-  // fragment it. Tools keep streaming live.
+  // Paseo turns repeated provider snapshots into separate timeline deltas:
+  // mapTimelineItem slices off the text it already saw for the same id. So a
+  // cumulative buffer is safe to re-emit, and must be — flushing text only at
+  // the end of the run moves every paragraph after the tool calls it preceded,
+  // which reads as one solid list of tools followed by one summary.
+  // Thinking keeps a per-block id and flushes at thinking_end.
   const flushReasoning = () => {
     if (!pendingReasoning) return;
     pendingReasoning = false;
@@ -976,13 +1017,27 @@ function runAgentTurn(
   const flushAssistant = () => {
     if (!pendingAssistant) return;
     pendingAssistant = false;
+    // The buffer must be sent cumulatively: mapTimelineItem slices off whatever
+    // prefix it already holds for this id. Sending only the new part breaks it
+    // whenever a fresh delta happens to start with the previous one ("ok" then
+    // "okay"), which the host reads as a repeat and drops.
     if (assistantText) push({ type: "assistant_message", id: `assistant-${turnId}`, text: assistantText });
+  };
+  // Text that arrived before a tool call belongs above that call, so flush the
+  // pending buffers first — otherwise the paragraph lands after the result it
+  // was reacting to.
+  const flushBeforeTool = () => {
+    flushReasoning();
+    flushAssistant();
   };
   const finish = (terminal: "completed" | "failed" | "canceled", error?: string) => {
     if (finished) return;
     finished = true;
     flushReasoning();
     flushAssistant();
+    // The turn that could read these files is over, so they go now rather than
+    // lingering in /tmp until the connection closes.
+    state.images.release(attachments);
     session.active = null;
     state.emit({
       type: "session.persistence",
@@ -1033,6 +1088,7 @@ function runAgentTurn(
           break;
         case "tool_queued":
         case "tool_running": {
+          flushBeforeTool();
           const existing = tools.get(parsed.toolCallId) ?? {
             name: parsed.toolName,
             input: parsed.kind === "tool_queued" ? parsed.input : {},

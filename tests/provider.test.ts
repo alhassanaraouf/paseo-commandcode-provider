@@ -1,8 +1,9 @@
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { buildArgs, parseLine, parseTaskGet, parseTaskId, parseTaskList } from "../server/commandcode.js";
+import { ImageMaterializer } from "../server/images.js";
 import { createCommandcodeProvider, makeTitle, type Proc, type SpawnFn } from "../server/provider.js";
 import { listNativeSessions, readNativeTranscript } from "../server/sessions.js";
 import { parseSkillsList } from "../server/skills.js";
@@ -173,6 +174,386 @@ describe("commandcode provider", () => {
     await connection.close();
   });
 
+  it("forwards images as a readable path instead of failing the prompt", async () => {
+    let spawnedArgs: string[] = [];
+    const stdout = stream();
+    const stderr = stream();
+    const procEvents = stream();
+    const fakeSpawn: SpawnFn = (_cmd, args) => {
+      spawnedArgs = args;
+      return {
+        stdout: stdout as unknown as Proc["stdout"],
+        stderr: stderr as unknown as Proc["stderr"],
+        on: procEvents.on,
+        kill: () => {},
+      } as Proc;
+    };
+    const connection = await createCommandcodeProvider({
+      spawn: fakeSpawn,
+      listModels: () => Promise.resolve(""),
+      log: () => {},
+    }).connect({
+      versions: [1],
+      capabilities: [
+        "prompt.message",
+        "prompt.image",
+        "session.configure",
+        "session.persistence",
+      ],
+    });
+    const events: ProviderEvent[] = [];
+    connection.onEvent((event) => events.push(event));
+    await connection.send({
+      type: "session.open",
+      requestId: "o1",
+      sessionId: "s1",
+      config: { cwd: "/tmp", env: {}, mcpServers: {}, settings: {}, persist: false },
+      history: "skip",
+    });
+    await tick();
+
+    const image =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: {
+        clientMessageId: "m1",
+        delivery: "auto",
+        input: {
+          type: "message",
+          content: [
+            { type: "text", text: "what colour is this?" },
+            { type: "image", data: image, mimeType: "image/png" },
+          ],
+        },
+      },
+    });
+    await tick();
+
+    // the prompt must reach the CLI, with the image referenced by path
+    expect(spawnedArgs.some((arg) => arg.includes("what colour is this?"))).toBe(true);
+    const hint = spawnedArgs.find((arg) => arg.includes("[Image available at:"));
+    expect(hint).toBeDefined();
+    const file = hint?.match(/\[Image available at: (.+)]/)?.[1];
+    expect(file).toBeDefined();
+    expect(file?.endsWith(".png")).toBe(true);
+    // read_file resolves the path, so the bytes must really be on disk
+    expect(readFileSync(file as string).equals(Buffer.from(image, "base64"))).toBe(true);
+
+    stdout.emit(
+      "data",
+      '{"type":"result","subtype":"success","sessionId":"native-1","finalText":"red"}\n',
+    );
+    procEvents.emit("close", 0);
+    await tick();
+    await tick();
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "session.prompt_result",
+        clientMessageId: "m1",
+        result: expect.objectContaining({ type: "turn" }),
+      }),
+    );
+    // released when the turn ends, not when the connection closes: the file is
+    // in a temp root, and macOS reaping /tmp is only unreachable if nothing
+    // outlives its own turn
+    expect(existsSync(file as string)).toBe(false);
+    await connection.close();
+  });
+
+  it("deletes the attachment once the turn finishes, while the connection stays open", async () => {
+    let spawnedArgs: string[] = [];
+    const stdout = stream();
+    const stderr = stream();
+    const procEvents = stream();
+    const fakeSpawn: SpawnFn = (_cmd, args) => {
+      spawnedArgs = args;
+      return {
+        stdout: stdout as unknown as Proc["stdout"],
+        stderr: stderr as unknown as Proc["stderr"],
+        on: procEvents.on,
+        kill: () => {},
+      } as Proc;
+    };
+    const connection = await createCommandcodeProvider({
+      spawn: fakeSpawn,
+      listModels: () => Promise.resolve(""),
+      log: () => {},
+    }).connect({
+      versions: [1],
+      capabilities: ["prompt.message", "prompt.image", "session.configure", "session.persistence"],
+    });
+    const events: ProviderEvent[] = [];
+    connection.onEvent((event) => events.push(event));
+    await connection.send({
+      type: "session.open",
+      requestId: "o1",
+      sessionId: "s1",
+      config: { cwd: "/tmp", env: {}, mcpServers: {}, settings: {}, persist: false },
+      history: "skip",
+    });
+    await tick();
+
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: {
+        clientMessageId: "m1",
+        delivery: "auto",
+        input: {
+          type: "message",
+          content: [
+            { type: "text", text: "look" },
+            {
+              type: "image",
+              data:
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+              mimeType: "image/png",
+            },
+          ],
+        },
+      },
+    });
+    await tick();
+
+    const file = spawnedArgs
+      .find((arg) => arg.includes("[Image available at:"))
+      ?.match(/\[Image available at: (.+)]/)?.[1] as string | undefined;
+    expect(file).toBeDefined();
+    // the model has not read it yet, so it must still be there
+    expect(existsSync(file as string)).toBe(true);
+
+    stdout.emit(
+      "data",
+      '{"type":"result","subtype":"success","sessionId":"native-1","finalText":"red"}\n',
+    );
+    procEvents.emit("close", 0);
+    await tick();
+    await tick();
+
+    // turn over, connection still open, file gone
+    expect(existsSync(file as string)).toBe(false);
+    await connection.close();
+  });
+
+  it("keeps the turn alive and warns when an image cannot be materialized", async () => {
+    let spawnedArgs: string[] = [];
+    const stdout = stream();
+    const stderr = stream();
+    const procEvents = stream();
+    const fakeSpawn: SpawnFn = (_cmd, args) => {
+      spawnedArgs = args;
+      return {
+        stdout: stdout as unknown as Proc["stdout"],
+        stderr: stderr as unknown as Proc["stderr"],
+        on: procEvents.on,
+        kill: () => {},
+      } as Proc;
+    };
+    // a 16-byte budget rejects any real image
+    const images = new ImageMaterializer(16);
+    const connection = await createCommandcodeProvider({
+      spawn: fakeSpawn,
+      listModels: () => Promise.resolve(""),
+      images,
+      log: () => {},
+    }).connect({
+      versions: [1],
+      capabilities: ["prompt.message", "prompt.image", "session.configure", "session.persistence"],
+    });
+    const events: ProviderEvent[] = [];
+    connection.onEvent((event) => events.push(event));
+    await connection.send({
+      type: "session.open",
+      requestId: "o1",
+      sessionId: "s1",
+      config: { cwd: "/tmp", env: {}, mcpServers: {}, settings: {}, persist: false },
+      history: "skip",
+    });
+    await tick();
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: {
+        clientMessageId: "m1",
+        delivery: "auto",
+        input: {
+          type: "message",
+          content: [
+            { type: "text", text: "look" },
+            {
+              type: "image",
+              data:
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+              mimeType: "image/png",
+            },
+          ],
+        },
+      },
+    });
+    await tick();
+
+    // the text still runs; the image degrades to a warning rather than a failure
+    expect(spawnedArgs.some((arg) => arg.includes("look"))).toBe(true);
+    expect(spawnedArgs.some((arg) => arg.includes("[Image available at:"))).toBe(false);
+    const notification = events.find(
+      (event): event is Extract<ProviderEvent, { type: "timeline.item" }> =>
+        event.type === "timeline.item" && event.item.type === "notification",
+    );
+    expect(notification?.item.type === "notification" ? notification.item.message : "").toContain(
+      "Image not forwarded",
+    );
+    await connection.close();
+  });
+
+  it("advertises prompt.image on the connection and on session.opened", async () => {
+    const connection = await createCommandcodeProvider({
+      spawn: () => {
+        throw new Error("no spawn in capability test");
+      },
+      listModels: () => Promise.resolve(""),
+      log: () => {},
+    }).connect({
+      versions: [1],
+      capabilities: ["prompt.message", "prompt.image", "session.configure", "session.persistence"],
+    });
+    // without this the host rejects any image prompt with
+    // "Provider does not support prompt.image" before the provider sees it
+    expect(connection.capabilities).toContain("prompt.image");
+
+    const events: ProviderEvent[] = [];
+    connection.onEvent((event) => events.push(event));
+    await connection.send({
+      type: "session.open",
+      requestId: "o1",
+      sessionId: "s1",
+      config: { cwd: "/tmp", env: {}, mcpServers: {}, settings: {}, persist: false },
+      history: "skip",
+    });
+    await tick();
+    const opened = events.find(
+      (event): event is Extract<ProviderEvent, { type: "session.opened" }> =>
+        event.type === "session.opened",
+    );
+    expect(opened?.capabilities).toContain("prompt.image");
+    await connection.close();
+  });
+
+  it("interleaves assistant text with tool calls in stream order", async () => {
+    const stdout = stream();
+    const stderr = stream();
+    const procEvents = stream();
+    const fakeSpawn: SpawnFn = () => {
+      return {
+        stdout: stdout as unknown as Proc["stdout"],
+        stderr: stderr as unknown as Proc["stderr"],
+        on: procEvents.on,
+        kill: () => {},
+      } as Proc;
+    };
+    const connection = await createCommandcodeProvider({
+      spawn: fakeSpawn,
+      listModels: () => Promise.resolve(""),
+      log: () => {},
+    }).connect({
+      versions: [1],
+      capabilities: ["prompt.message", "prompt.image", "session.configure", "session.persistence"],
+    });
+    const events: ProviderEvent[] = [];
+    connection.onEvent((event) => events.push(event));
+    await connection.send({
+      type: "session.open",
+      requestId: "o1",
+      sessionId: "s1",
+      config: { cwd: "/tmp", env: {}, mcpServers: {}, settings: {}, persist: false },
+      history: "skip",
+    });
+    await tick();
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: {
+        clientMessageId: "m1",
+        delivery: "auto",
+        input: { type: "message", content: [{ type: "text", text: "do the thing" }] },
+      },
+    });
+    await tick();
+
+    // text, then a tool, then more text, then another tool, then a summary:
+    // the timeline must preserve exactly this order
+    stdout.emit(
+      "data",
+      '{"type":"event","event":{"type":"run_start","sessionId":"native-1"}}\n' +
+        '{"type":"event","event":{"type":"text_delta","delta":"First I check the config.\\n\\n"}}\n' +
+        '{"type":"event","event":{"type":"tool_queued","toolCallId":"c1","toolName":"read_file","input":{"file_path":"a.ts"}}}\n' +
+        '{"type":"event","event":{"type":"tool_completed","toolCallId":"c1","toolName":"read_file","result":[{"type":"text","text":"contents"}]}}\n' +
+        '{"type":"event","event":{"type":"text_delta","delta":"Now I run the tests.\\n\\n"}}\n' +
+        '{"type":"event","event":{"type":"tool_queued","toolCallId":"c2","toolName":"shell","input":{"command":"npm test"}}}\n' +
+        '{"type":"event","event":{"type":"tool_completed","toolCallId":"c2","toolName":"shell","result":[{"type":"text","text":"ok"}]}}\n' +
+        '{"type":"event","event":{"type":"text_delta","delta":"All done, everything passes."}}\n' +
+        '{"type":"result","subtype":"success","sessionId":"native-1","finalText":"All done, everything passes."}\n',
+    );
+    procEvents.emit("close", 0);
+    await tick();
+    await tick();
+
+    const timeline = events
+      .filter((event): event is Extract<ProviderEvent, { type: "timeline.item" }> =>
+        event.type === "timeline.item",
+      )
+      .map((event) => event.item)
+      .filter((item) => item.type === "assistant_message" || item.type === "tool_call")
+      .map((item) =>
+        item.type === "assistant_message" ? `text:${item.text}` : `tool:${item.callId ?? item.id}`,
+      );
+
+    // The host slices the prefix it already holds per id, so each flush carries
+    // the whole buffer and the visible text is the growing suffix.
+    expect(timeline).toEqual([
+      "text:First I check the config.\n\n",
+      "tool:c1",
+      "tool:c1",
+      "text:First I check the config.\n\nNow I run the tests.\n\n",
+      "tool:c2",
+      "tool:c2",
+      "text:First I check the config.\n\nNow I run the tests.\n\nAll done, everything passes.",
+    ]);
+    await connection.close();
+  });
+
+  it("emits cumulative text so a delta that re-prefixes the previous one is not dropped", async () => {
+    const { connection, events, stdout, procEvents } = await startTurn();
+
+    feed(stdout, [
+      { type: "event", event: { type: "text_delta", delta: "ok" } },
+      { type: "event", event: { type: "tool_queued", toolCallId: "c1", toolName: "read_file", input: { path: "a.ts" } } },
+      // starts with the text the host already holds, so a delta-only emission
+      // would be read as a repeat and dropped
+      { type: "event", event: { type: "tool_completed", toolCallId: "c1", toolName: "read_file", result: [{ type: "text", text: "x" }] } },
+      { type: "event", event: { type: "text_delta", delta: "okay then" } },
+      { type: "result", sessionId: "native-1", finalText: "okokay then" },
+    ]);
+    procEvents.emit("close", 0);
+    await tick();
+
+    const assistant = timelineOf(events).filter(
+      (item): item is Extract<ProviderTimelineItem, { type: "assistant_message" }> =>
+        item.type === "assistant_message",
+    );
+    // what the host renders: mapTimelineItem slices the prefix it already saw
+    let previous = "";
+    let rendered = "";
+    for (const item of assistant) {
+      const text = item.text.startsWith(previous) ? item.text.slice(previous.length) : item.text;
+      if (text.length > 0) rendered += text;
+      previous = item.text;
+    }
+    expect(rendered).toBe("okokay then");
+    await connection.close();
+  });
+
   it("runs a prompt lifecycle against a fake commandcode", async () => {
     let spawnedArgs: string[] = [];
     const stdout = stream();
@@ -316,8 +697,14 @@ describe("commandcode provider", () => {
     const assistant = timeline.filter((event) => event.item.type === "assistant_message");
     expect(reasoning).toHaveLength(1);
     expect(reasoning.at(-1)?.item).toMatchObject({ type: "reasoning", text: "check the code" });
-    expect(assistant).toHaveLength(1);
-    expect(assistant.at(-1)?.item).toMatchObject({ type: "assistant_message", text: "Fixed it." });
+    // "Fixed " flushes above the tool call and "it." above the completion, so the
+    // paragraphs land where they were streamed. Cumulative text under one id
+    // means the host slices the prefix and shows the growing suffix.
+    expect(assistant.map((event) => event.item.type === "assistant_message" && event.item.text)).toEqual([
+      "Fixed ",
+      "Fixed it.",
+    ]);
+    expect(new Set(assistant.map((event) => event.item.id)).size).toBe(1);
     expect(timeline.filter((event) => event.item.type === "tool_call")).toHaveLength(2);
     await connection.close();
   });
@@ -375,7 +762,7 @@ describe("commandcode provider", () => {
       .map((event) => event.item);
   }
 
-  it("keeps buffered text until the run ends when a later thinking/tool cycle follows", async () => {
+  it("flushes text above the tool call it preceded, not at the end of the run", async () => {
     const { connection, events, stdout, procEvents } = await startTurn();
 
     feed(stdout, [
@@ -389,8 +776,13 @@ describe("commandcode provider", () => {
     ]);
     await tick();
 
+    // the paragraph streamed before read_file must already be on the timeline,
+    // above the call, or it reads as a summary of work the user has not seen yet
     const midRun = timelineOf(events);
-    expect(midRun.some((item) => item.type === "assistant_message")).toBe(false);
+    const textIndex = midRun.findIndex((item) => item.type === "assistant_message");
+    const toolIndex = midRun.findIndex((item) => item.type === "tool_call");
+    expect(textIndex).toBeGreaterThanOrEqual(0);
+    expect(toolIndex).toBeGreaterThan(textIndex);
     expect(midRun.filter((item) => item.type === "reasoning")).toHaveLength(1);
     expect(midRun.filter((item) => item.type === "tool_call")).toHaveLength(2);
 
@@ -406,10 +798,11 @@ describe("commandcode provider", () => {
       (item): item is Extract<ProviderTimelineItem, { type: "assistant_message" }> =>
         item.type === "assistant_message",
     );
-    expect(assistant).toHaveLength(1);
+    // two flushes under one id, each carrying the cumulative buffer
+    expect(assistant.map((item) => item.text)).toEqual(["Fixed ", "Fixed it."]);
     expect(assistant[0].id).toMatch(/^assistant-/);
-    expect(assistant[0].text).toBe("Fixed it.");
-    expect(finished.findIndex((item) => item.type === "assistant_message")).toBeGreaterThan(
+    expect(new Set(assistant.map((item) => item.id)).size).toBe(1);
+    expect(finished.findLastIndex((item) => item.type === "assistant_message")).toBeGreaterThan(
       finished.findLastIndex((item) => item.type === "tool_call"),
     );
     await connection.close();

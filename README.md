@@ -34,6 +34,7 @@ Then create an agent with the **Command Code** provider.
 ## What works
 
 - **Messages** — prompts run headless (`commandcode -p --output-format json`), streamed into the timeline (text, thinking, tool calls, usage).
+- **Images** — attachments are materialized to a private temp file and passed by path (`[Image available at: …]`), which `read_file` resolves into an image block. Capped at 16 MiB; see Known issues.
 - **Tasks** — `task_create` / `task_update` / `task_list` / `task_get` maintain a session task list shown in the Tasks pill (`todo` timeline item, like the opencode provider).
 - **Models** — full live list from `commandcode --list-models` (1h cache, fallback on failure).
 - **Modes** — Build / Plan (`--plan`).
@@ -52,7 +53,8 @@ Then create an agent with the **Command Code** provider.
 ## Known issues
 
 - Interactive/TTY-only features (`/usage`, `/login`, `/connect`, IDE setup) are unavailable headless — ask for them in the model prompt instead.
-- Images and steering are rejected with a clear error (the CLI has no image flag or live-turn channel; v2 may use the Provider API).
+- Steering is rejected with a clear error (the CLI has no live-turn channel; v2 may use the Provider API).
+- Images need a vision-capable model. `commandcode -p` has no image flag, so attached images are written to a private file under the system temp directory and referenced by path as `[Image available at: …]` — `read_file` turns that path into a real image block for the model. The temp location is required, not incidental: the CLI auto-allows reads only under its temp roots and the workspace, so a file anywhere else (e.g. under `$PASEO_HOME`) comes back `tool_denied` headless and the turn ends with no response. Each file is deleted when its turn ends, so nothing outlives the session that referenced it. Images are capped at 16 MiB; one that is too large is dropped with a warning and the rest of the prompt still runs. The model still has to call `read_file` on the path, and a model without vision reports that it cannot see the image.
 - Effort levels are per-model (e.g. deepseek flash accepts only high/max) — the selector is omit-by-default so untouched sessions never error. Models probed as effortless (e.g. MiMo Flash rejects `--effort` at startup) get per-model `thinkingOptions: []` so the host hides the Thinking pill, stale pill values are stripped on model switch, and the turn is retried once without `--effort` instead of failing.
 
 ## Develop
