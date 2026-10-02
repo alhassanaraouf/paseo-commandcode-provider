@@ -188,12 +188,9 @@ describe("commandcode provider", () => {
         kill: () => {},
       } as Proc;
     };
-    const home = mkdtempSync(join(tmpdir(), "paseo-home-"));
-    const images = new ImageMaterializer(16 * 1024 * 1024, { PASEO_HOME: home });
     const connection = await createCommandcodeProvider({
       spawn: fakeSpawn,
       listModels: () => Promise.resolve(""),
-      images,
       log: () => {},
     }).connect({
       versions: [1],
@@ -258,9 +255,86 @@ describe("commandcode provider", () => {
         result: expect.objectContaining({ type: "turn" }),
       }),
     );
-    await connection.close();
-    // closing the connection reaps the attachment directory
+    // released when the turn ends, not when the connection closes: the file is
+    // in a temp root, and macOS reaping /tmp is only unreachable if nothing
+    // outlives its own turn
     expect(existsSync(file as string)).toBe(false);
+    await connection.close();
+  });
+
+  it("deletes the attachment once the turn finishes, while the connection stays open", async () => {
+    let spawnedArgs: string[] = [];
+    const stdout = stream();
+    const stderr = stream();
+    const procEvents = stream();
+    const fakeSpawn: SpawnFn = (_cmd, args) => {
+      spawnedArgs = args;
+      return {
+        stdout: stdout as unknown as Proc["stdout"],
+        stderr: stderr as unknown as Proc["stderr"],
+        on: procEvents.on,
+        kill: () => {},
+      } as Proc;
+    };
+    const connection = await createCommandcodeProvider({
+      spawn: fakeSpawn,
+      listModels: () => Promise.resolve(""),
+      log: () => {},
+    }).connect({
+      versions: [1],
+      capabilities: ["prompt.message", "prompt.image", "session.configure", "session.persistence"],
+    });
+    const events: ProviderEvent[] = [];
+    connection.onEvent((event) => events.push(event));
+    await connection.send({
+      type: "session.open",
+      requestId: "o1",
+      sessionId: "s1",
+      config: { cwd: "/tmp", env: {}, mcpServers: {}, settings: {}, persist: false },
+      history: "skip",
+    });
+    await tick();
+
+    await connection.send({
+      type: "session.prompt",
+      sessionId: "s1",
+      prompt: {
+        clientMessageId: "m1",
+        delivery: "auto",
+        input: {
+          type: "message",
+          content: [
+            { type: "text", text: "look" },
+            {
+              type: "image",
+              data:
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+              mimeType: "image/png",
+            },
+          ],
+        },
+      },
+    });
+    await tick();
+
+    const file = spawnedArgs
+      .find((arg) => arg.includes("[Image available at:"))
+      ?.match(/\[Image available at: (.+)]/)?.[1] as string | undefined;
+    expect(file).toBeDefined();
+    // the model has not read it yet, so it must still be there
+    expect(existsSync(file as string)).toBe(true);
+
+    stdout.emit(
+      "data",
+      '{"type":"result","subtype":"success","sessionId":"native-1","finalText":"red"}\n',
+    );
+    procEvents.emit("close", 0);
+    await tick();
+    await tick();
+
+    // turn over, connection still open, file gone
+    expect(existsSync(file as string)).toBe(false);
+    await connection.close();
   });
 
   it("keeps the turn alive and warns when an image cannot be materialized", async () => {
@@ -277,9 +351,8 @@ describe("commandcode provider", () => {
         kill: () => {},
       } as Proc;
     };
-    const home = mkdtempSync(join(tmpdir(), "paseo-home-"));
     // a 16-byte budget rejects any real image
-    const images = new ImageMaterializer(16, { PASEO_HOME: home });
+    const images = new ImageMaterializer(16);
     const connection = await createCommandcodeProvider({
       spawn: fakeSpawn,
       listModels: () => Promise.resolve(""),

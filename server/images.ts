@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmodSync, lstatSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
@@ -19,20 +19,23 @@ const PRIVATE_DIRECTORY_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
 const MAX_MATERIALIZED_IMAGE_BYTES = 16 * 1024 * 1024;
 
-function expandHomeDir(input: string): string {
-  if (input === "~") return os.homedir();
-  if (input.startsWith("~/")) return path.join(os.homedir(), input.slice(2));
-  return input;
-}
-
 /**
- * Attachments live under PASEO_HOME rather than os.tmpdir(): macOS reaps
- * /tmp children after ~3 days, which would delete files a still-running session
- * refers to. Falls back to tmpdir when PASEO_HOME is not writable.
+ * Attachments must live under a temp root. The CLI auto-allows reads from
+ * `systemTempRoots()` (os.tmpdir(), /tmp, $TMPDIR) and the workspace roots;
+ * anything else outside the workspace needs an interactive approval, which
+ * headless cannot grant, so read_file comes back `tool_denied` and the turn ends
+ * with no response. Verified against commandcode 1.74.0:
+ *
+ *   /tmp/<image>.png                  -> read, image returned
+ *   ~/.paseo/plugin-data/.../<image>  -> tool_denied (also with --add-dir)
+ *   ~/.paseo/plugin-data/.../<image>  -> read, but only under --yolo
+ *
+ * macOS reaps /tmp children after ~3 days, so lifetime is bounded instead of
+ * location: `release` deletes each turn's files once the turn ends, and `clear`
+ * removes the directory on connection close. Nothing survives its own turn.
  */
-function attachmentRoot(env: NodeJS.ProcessEnv = process.env): string {
-  const home = env.PASEO_HOME ?? "~/.paseo";
-  return path.join(path.resolve(expandHomeDir(home)), "plugin-data", "commandcode-provider");
+function attachmentRoot(): string {
+  return os.tmpdir();
 }
 
 export class ImageMaterializer {
@@ -40,10 +43,7 @@ export class ImageMaterializer {
   private readonly files = new Map<string, { path: string; bytes: number }>();
   private retainedBytes = 0;
 
-  constructor(
-    private readonly maxBytes = MAX_MATERIALIZED_IMAGE_BYTES,
-    private readonly env: NodeJS.ProcessEnv = process.env,
-  ) {}
+  constructor(private readonly maxBytes = MAX_MATERIALIZED_IMAGE_BYTES) {}
 
   materialize(image: { data: string; mimeType: string }): string {
     const data = image.data.startsWith("data:")
@@ -70,14 +70,31 @@ export class ImageMaterializer {
     return file;
   }
 
+  /**
+   * Delete the files a finished turn materialized. A path still held by another
+   * live turn is kept, so overlapping turns cannot pull the file out from under
+   * a model that is about to read it.
+   */
+  release(paths: Iterable<string>): void {
+    const releasing = new Set(paths);
+    for (const [hash, file] of [...this.files]) {
+      if (!releasing.has(file.path)) continue;
+      this.files.delete(hash);
+      this.retainedBytes -= file.bytes;
+      try {
+        unlinkSync(file.path);
+      } catch {
+        // Already gone (or the directory was reaped): nothing to reclaim.
+      }
+    }
+  }
+
   clear(): void {
     this.files.clear();
     this.retainedBytes = 0;
     const directory = this.directory;
     this.directory = null;
     if (!directory) return;
-    // Only remove the leaf we created; a PASEO_HOME root is shared with the
-    // other plugin-data directories and must survive.
     rmSync(directory, { force: true, recursive: true });
   }
 
@@ -105,15 +122,10 @@ export class ImageMaterializer {
   }
 
   private createDirectory(): string {
-    const root = attachmentRoot(this.env);
-    try {
-      mkdirSync(root, { mode: PRIVATE_DIRECTORY_MODE, recursive: true });
-      return mkdtempSync(path.join(root, `${ATTACHMENT_DIRECTORY_PREFIX}`));
-    } catch {
-      // A read-only or missing PASEO_HOME still leaves tmpdir usable.
-      const directory = mkdtempSync(path.join(os.tmpdir(), ATTACHMENT_DIRECTORY_PREFIX));
-      chmodSync(directory, PRIVATE_DIRECTORY_MODE);
-      return directory;
-    }
+    // mkdtempSync creates the leaf 0700 already; chmod is belt-and-braces in
+    // case a future platform default loosens it.
+    const directory = mkdtempSync(path.join(attachmentRoot(), ATTACHMENT_DIRECTORY_PREFIX));
+    chmodSync(directory, PRIVATE_DIRECTORY_MODE);
+    return directory;
   }
 }

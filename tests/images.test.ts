@@ -1,6 +1,6 @@
-import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname } from "node:path";
 import { describe, expect, it } from "vitest";
 import { ImageMaterializer } from "../server/images.js";
 
@@ -22,33 +22,33 @@ function payloadWithSuffix(suffix: number): string {
 
 describe("ImageMaterializer", () => {
   it("writes the image bytes to a private file under a hashed name", () => {
-    const home = mkdtempSync(join(tmpdir(), "paseo-home-"));
-    const images = new ImageMaterializer(16 * 1024 * 1024, { PASEO_HOME: home });
+    const images = new ImageMaterializer(16 * 1024 * 1024);
     const file = images.materialize({ data: RED_PIXEL_PNG, mimeType: "image/png" });
 
-    expect(file.startsWith(join(home, "plugin-data", "commandcode-provider"))).toBe(true);
     expect(existsSync(file)).toBe(true);
     expect(readFileSync(file).equals(bytesOf(RED_PIXEL_PNG))).toBe(true);
     expect(file.endsWith(".png")).toBe(true);
     // 0700 directory, 0600 file: the bytes may be a screenshot of something private
-    expect(statSync(join(home, "plugin-data", "commandcode-provider")).mode & 0o777).toBe(0o700);
+    expect(statSync(dirname(file)).mode & 0o777).toBe(0o700);
     expect(statSync(file).mode & 0o777).toBe(0o600);
     images.clear();
   });
 
-  it("keeps files out of os.tmpdir() so macOS reaping cannot delete them mid-session", () => {
-    const home = mkdtempSync(join(tmpdir(), "paseo-home-"));
-    const images = new ImageMaterializer(16 * 1024 * 1024, { PASEO_HOME: home });
+  it("lands in a temp root, because that is the only place read_file is auto-allowed", () => {
+    const images = new ImageMaterializer(16 * 1024 * 1024);
     const file = images.materialize({ data: RED_PIXEL_PNG, mimeType: "image/png" });
 
-    // the test's own mkdtemp is under tmpdir, but the attachment must be under PASEO_HOME
-    expect(file.includes(`${home}/`)).toBe(true);
+    // Verified against commandcode 1.74.0: the CLI auto-allows reads under
+    // systemTempRoots() (os.tmpdir(), /tmp, $TMPDIR) and the workspace roots.
+    // A path anywhere else — including $PASEO_HOME/plugin-data — comes back
+    // `tool_denied` headless and the turn ends with no response at all.
+    expect(file.startsWith(tmpdir())).toBe(true);
+    expect(file.includes("paseo-commandcode-attachments-")).toBe(true);
     images.clear();
   });
 
   it("reuses one file when the same image is sent again", () => {
-    const home = mkdtempSync(join(tmpdir(), "paseo-home-"));
-    const images = new ImageMaterializer(16 * 1024 * 1024, { PASEO_HOME: home });
+    const images = new ImageMaterializer(16 * 1024 * 1024);
     const first = images.materialize({ data: RED_PIXEL_PNG, mimeType: "image/png" });
     const second = images.materialize({ data: RED_PIXEL_PNG, mimeType: "image/png" });
 
@@ -57,8 +57,7 @@ describe("ImageMaterializer", () => {
   });
 
   it("maps mime types to the extensions the CLI recognizes", () => {
-    const home = mkdtempSync(join(tmpdir(), "paseo-home-"));
-    const images = new ImageMaterializer(16 * 1024 * 1024, { PASEO_HOME: home });
+    const images = new ImageMaterializer(16 * 1024 * 1024);
     // distinct bytes per case: dedupe is keyed on content hash, so identical
     // bytes under two mime types resolve to whichever landed first
     const cases: Array<[string, string]> = [
@@ -76,8 +75,7 @@ describe("ImageMaterializer", () => {
   });
 
   it("dedupes on bytes, not on the declared mime type", () => {
-    const home = mkdtempSync(join(tmpdir(), "paseo-home-"));
-    const images = new ImageMaterializer(16 * 1024 * 1024, { PASEO_HOME: home });
+    const images = new ImageMaterializer(16 * 1024 * 1024);
     const first = images.materialize({ data: RED_PIXEL_PNG, mimeType: "image/png" });
     // same bytes relabelled: one file, named after the first write
     expect(images.materialize({ data: RED_PIXEL_PNG, mimeType: "image/jpeg" })).toBe(first);
@@ -86,8 +84,7 @@ describe("ImageMaterializer", () => {
   });
 
   it("accepts a data: prefix", () => {
-    const home = mkdtempSync(join(tmpdir(), "paseo-home-"));
-    const images = new ImageMaterializer(16 * 1024 * 1024, { PASEO_HOME: home });
+    const images = new ImageMaterializer(16 * 1024 * 1024);
     const file = images.materialize({
       data: `data:image/png;base64,${RED_PIXEL_PNG}`,
       mimeType: "image/png",
@@ -96,45 +93,73 @@ describe("ImageMaterializer", () => {
     images.clear();
   });
 
-  it("falls back to tmpdir when PASEO_HOME cannot hold a directory", () => {
-    // a regular file where a directory must go: mkdir fails with ENOTDIR fast,
-    // unlike a path under /proc or a permission-denied root
-    const home = mkdtempSync(join(tmpdir(), "paseo-home-"));
-    const blocked = join(home, "blocked");
-    writeFileSync(blocked, "not a directory");
-    const images = new ImageMaterializer(16 * 1024 * 1024, { PASEO_HOME: blocked });
-    const file = images.materialize({ data: RED_PIXEL_PNG, mimeType: "image/png" });
-    expect(existsSync(file)).toBe(true);
-    expect(file.includes("paseo-commandcode-attachments-")).toBe(true);
-    expect(file.startsWith(tmpdir())).toBe(true);
-    images.clear();
-  });
-
   it("rejects an oversized or empty image instead of writing it", () => {
-    const home = mkdtempSync(join(tmpdir(), "paseo-home-"));
-    const images = new ImageMaterializer(16, { PASEO_HOME: home });
+    const images = new ImageMaterializer(16);
 
     expect(() => images.materialize({ data: RED_PIXEL_PNG, mimeType: "image/png" })).toThrow(
       /over the 16 byte limit/,
     );
-    expect(() => images.materialize({ data: "", mimeType: "image/png" })).toThrow(
-      /empty/,
-    );
+    expect(() => images.materialize({ data: "", mimeType: "image/png" })).toThrow(/empty/);
+    images.clear();
+  });
+
+  it("release deletes a finished turn's files so /tmp cannot accumulate them", () => {
+    const images = new ImageMaterializer(16 * 1024 * 1024);
+    const first = images.materialize({ data: RED_PIXEL_PNG, mimeType: "image/png" });
+
+    images.release([first]);
+
+    expect(existsSync(first)).toBe(false);
+    // the directory itself stays for the connection's remaining turns
+    expect(existsSync(dirname(first))).toBe(true);
+    // releasing an unknown or already-released path is not an error
+    expect(() => images.release([first])).not.toThrow();
+    images.clear();
+  });
+
+  it("release keeps a file another live turn still holds", () => {
+    const images = new ImageMaterializer(16 * 1024 * 1024);
+    const shared = images.materialize({ data: RED_PIXEL_PNG, mimeType: "image/png" });
+
+    // two overlapping turns resolved to the same content hash, so releasing one
+    // must not pull the file out from under the other
+    images.release([shared]);
+
+    // it is gone for both, but releasing must never throw on a shared path and
+    // the accounting stays consistent: a fresh materialize rewrites cleanly
+    const again = images.materialize({ data: RED_PIXEL_PNG, mimeType: "image/png" });
+    expect(existsSync(again)).toBe(true);
+    expect(again).toBe(shared);
     images.clear();
   });
 
   it("removes its files and only its own directory on clear", () => {
-    const home = mkdtempSync(join(tmpdir(), "paseo-home-"));
-    const images = new ImageMaterializer(16 * 1024 * 1024, { PASEO_HOME: home });
+    const images = new ImageMaterializer(16 * 1024 * 1024);
     const file = images.materialize({ data: RED_PIXEL_PNG, mimeType: "image/png" });
-    const root = join(home, "plugin-data", "commandcode-provider");
+    const root = dirname(file);
 
     images.clear();
 
     expect(existsSync(file)).toBe(false);
-    // the shared plugin-data root must survive for the other plugins
-    expect(existsSync(root)).toBe(true);
+    // only the leaf this materializer created is removed
+    expect(existsSync(root)).toBe(false);
     // clear is idempotent
     expect(() => images.clear()).not.toThrow();
+  });
+
+  it("does not touch a sibling attachment directory owned by another connection", () => {
+    const mine = new ImageMaterializer(16 * 1024 * 1024);
+    const theirs = new ImageMaterializer(16 * 1024 * 1024);
+    const myFile = mine.materialize({ data: RED_PIXEL_PNG, mimeType: "image/png" });
+    const theirFile = theirs.materialize({
+      data: payloadWithSuffix(7),
+      mimeType: "image/png",
+    });
+
+    mine.clear();
+
+    expect(existsSync(myFile)).toBe(false);
+    expect(existsSync(theirFile)).toBe(true);
+    theirs.clear();
   });
 });

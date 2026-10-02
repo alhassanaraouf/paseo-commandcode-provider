@@ -752,15 +752,18 @@ function configureSession(
 function promptText(
   content: ProviderContent[],
   images: ImageMaterializer,
-): { text: string; unsupported: string[] } {
+): { text: string; unsupported: string[]; attachments: string[] } {
   let text = "";
   const unsupported = new Set<string>();
+  const attachments: string[] = [];
   for (const part of content) {
     if (part.type === "text") text += (text ? "\n" : "") + part.text;
     else if (part.type === "image") {
       // read_file attaches an image by absolute path, so the model still sees it
       try {
-        text += (text ? "\n" : "") + `[Image available at: ${images.materialize(part)}]`;
+        const file = images.materialize(part);
+        attachments.push(file);
+        text += (text ? "\n" : "") + `[Image available at: ${file}]`;
       } catch (error) {
         unsupported.add(
           `Image not forwarded (${error instanceof Error ? error.message : String(error)})`,
@@ -773,7 +776,7 @@ function promptText(
       unsupported.add(`Attachments of type "${part.type}" are not forwarded`);
     }
   }
-  return { text, unsupported: [...unsupported] };
+  return { text, unsupported: [...unsupported], attachments };
 }
 
 function flagsFor(session: Session, state?: ConnectionState): RunFlags {
@@ -813,7 +816,7 @@ function promptSession(
     runSlashCommand(input.sessionId, session, input.prompt.clientMessageId, input.prompt.input.name, input.prompt.input.arguments, state);
     return;
   }
-  const { text, unsupported } = promptText(input.prompt.input.content, state.images);
+  const { text, unsupported, attachments } = promptText(input.prompt.input.content, state.images);
   if (!text.trim()) {
     fail(["Empty prompt", ...unsupported].join(". "));
     return;
@@ -834,7 +837,10 @@ function promptSession(
       });
     }
   }
-  runAgentTurn(input.sessionId, session, input.prompt.clientMessageId, text, state);
+  // Materialized images live in a temp root the CLI auto-allows reads from, so
+  // they are scoped to this turn rather than to the connection: macOS reaps
+  // /tmp after ~3 days, and a per-turn lifetime makes that unreachable.
+  runAgentTurn(input.sessionId, session, input.prompt.clientMessageId, text, state, attachments);
 }
 
 function runSlashCommand(
@@ -882,6 +888,8 @@ function runAgentTurn(
   clientMessageId: string,
   text: string,
   state: ConnectionState,
+  /** Image files this turn materialized, released once the turn ends. */
+  attachments: string[] = [],
 ): void {
   const fail = (message: string) => {
     state.emit({
@@ -893,6 +901,7 @@ function runAgentTurn(
   };
   if (session.active) {
     fail("A turn is already running");
+    state.images.release(attachments);
     return;
   }
 
@@ -974,6 +983,7 @@ capabilities: [...SESSION_CAPABILITIES],
       state: "failed",
       error: { message: friendlySpawnError(error, state) },
     });
+    state.images.release(attachments);
     return;
   }
   session.active = { turnId, proc, interrupted: false };
@@ -1025,6 +1035,9 @@ capabilities: [...SESSION_CAPABILITIES],
     finished = true;
     flushReasoning();
     flushAssistant();
+    // The turn that could read these files is over, so they go now rather than
+    // lingering in /tmp until the connection closes.
+    state.images.release(attachments);
     session.active = null;
     state.emit({
       type: "session.persistence",
