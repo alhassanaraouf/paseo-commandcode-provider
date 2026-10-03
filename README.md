@@ -33,29 +33,42 @@ Then create an agent with the **Command Code** provider.
 
 ## What works
 
-- **Messages** — prompts run headless (`commandcode -p --output-format json`), streamed into the timeline (text, thinking, tool calls, usage).
-- **Images** — attachments are materialized to a private temp file and passed by path (`[Image available at: …]`), which `read_file` resolves into an image block. Capped at 16 MiB; see Known issues.
-- **Tasks** — `task_create` / `task_update` / `task_list` / `task_get` maintain a session task list shown in the Tasks pill (`todo` timeline item, like the opencode provider).
-- **Models** — full live list from `commandcode --list-models` (1h cache, fallback on failure).
-- **Modes** — Build / Plan (`--plan`).
-- **Effort** — optional per-model selector (low/medium/high/max); omitted by default because valid levels differ per model.
-- **Persistence** — native session id + task list stored opaquely; resume via `--session`, replay on reopen (tasks rebuilt from the native transcript).
-- **Health** — probes the CLI (`--version`) on session open; a missing binary or failed probe surfaces an actionable notice (which binary, where it's from, `commandcode login` / `commandcode status` hints) instead of a bare ENOENT.
-- **Commands** (composer `/` menu, side effects via the CLI):
-  - `/status`, `/info`, `/models`, `/mcp-list`
-  - `/taste-list`, `/taste-learn [path|owner/repo]`
-  - `/skills-list`, `/skills-add <owner/repo>`
-  - `/mods-list`, `/mods-add <source>`
-- **Skills** — installed skills (`commandcode skills list`) appear in the composer `/` menu and run as agent turns (`/paseo ...`), like other providers.
+The provider talks to the **Command Code ACP server** (`commandcode acp`), the same
+Agent Client Protocol interface Zed uses, via Paseo's `runAcpProvider`. That means
+one long-lived session per agent instead of a fresh `-p` process per turn.
+
+- **Messages** — streamed into the timeline as text, thinking, tool calls and usage, in the order the agent produces them.
+- **Images** — sent as native ACP image blocks (`promptCapabilities.image`), so no temp file and no size dance. Requires a vision-capable model.
+- **Cancel-and-continue** — sending a message while a turn runs cancels that turn (`stopReason: "cancelled"`) and continues on the same session, so context survives. This is **not** mid-turn steering: ACP rejects a concurrent prompt outright (`A prompt is already running for this session`), and partial work in the cancelled turn is lost. Paseo's ACP adapter reports `steer` as unavailable for every ACP agent, since `prompt.steer` is not among its capabilities.
+- **Sessions** — `loadSession` + `session/list` give real persistence and resume; a session started in Paseo shows up in the terminal's `/resume` list.
+- **Models, modes, effort** — the catalog, the five permission modes (`default`, `auto-accept`, `plan`, `dont-ask`, `bypass`) and per-model effort all arrive over ACP.
+- **Permissions** — prompts surface as approve/reject with the mode shown in the UI.
+- **Tasks** — the Tasks pill is fed by ACP `plan` updates. Verified: a `todo_write` turn emits `plan` entries with `pending`/`completed` statuses.
+- **Slash commands** — project commands, skills and mod commands, plus `/compact`.
 - Interrupt cancels the running turn (emits `canceled`, no dangling turn).
-- Session titles derive from the first prompt when the host provides none.
+
+Two things the previous `-p` transport had and this one does not:
+
+- **Session title from the first prompt.** The ACP adapter passes through whatever title the host supplies and has no fallback, so a session you never named is untitled.
+- **An actionable health notice.** The old provider probed `--version` and surfaced which binary it resolved, where that came from, and `commandcode login` / `commandcode status` hints. The ACP provider defines no `status` callback, so a missing binary or a disabled ACP mod shows up as a generic spawn failure or a timeout.
+
+### Legacy `-p` transport
+
+`server/provider.ts` still contains the previous headless implementation (NDJSON
+parsing of `commandcode -p --output-format json`, image materialization to a temp
+file). It is **not registered**, and there is no setting to switch to it: both
+providers claim the id `commandcode` and the host rejects duplicate provider ids.
+Reaching it means editing `index.server.ts`, so treat it as reference, not a
+fallback. It matters only when the ACP mod is disabled
+(`{"mods": {"disabled": ["acp"]}}` makes `cmd acp` refuse to start), because then
+this provider has no working transport at all.
 
 ## Known issues
 
 - Interactive/TTY-only features (`/usage`, `/login`, `/connect`, IDE setup) are unavailable headless — ask for them in the model prompt instead.
-- Steering is rejected with a clear error (the CLI has no live-turn channel; v2 may use the Provider API).
-- Images need a vision-capable model. `commandcode -p` has no image flag, so attached images are written to a private file under the system temp directory and referenced by path as `[Image available at: …]` — `read_file` turns that path into a real image block for the model. The temp location is required, not incidental: the CLI auto-allows reads only under its temp roots and the workspace, so a file anywhere else (e.g. under `$PASEO_HOME`) comes back `tool_denied` headless and the turn ends with no response. Each file is deleted when its turn ends, so nothing outlives the session that referenced it. Images are capped at 16 MiB; one that is too large is dropped with a warning and the rest of the prompt still runs. The model still has to call `read_file` on the path, and a model without vision reports that it cannot see the image.
-- Effort levels are per-model (e.g. deepseek flash accepts only high/max) — the selector is omit-by-default so untouched sessions never error. Models probed as effortless (e.g. MiMo Flash rejects `--effort` at startup) get per-model `thinkingOptions: []` so the host hides the Thinking pill, stale pill values are stripped on model switch, and the turn is retried once without `--effort` instead of failing.
+- Paseo reports `steer` as unavailable for this provider. The built-in ACP adapter lists only `prompt.message`, `prompt.command`, `session.configure` and `permission`, so `steerActiveTurn` never sees a steer result and falls back to a fresh turn. Sending a message mid-run therefore cancels the running turn rather than injecting into it.
+- Images need a vision-capable model. Over ACP the image is a native content block, but the model still has to be one that can see it.
+- Effort levels are per-model, so the picker only offers the levels a model accepts.
 
 ## Develop
 
