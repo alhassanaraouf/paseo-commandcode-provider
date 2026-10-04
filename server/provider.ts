@@ -208,8 +208,8 @@ export function createCommandcodeProvider(options?: {
       const platformDefault = process.platform === "win32" ? "cmdc" : "commandcode";
       const configured = readSettingsDocument(cliSettings, CLI_DEFAULTS).command.trim();
       const envOverride = process.env.COMMANDCODE_CLI_COMMAND?.trim();
-      const command = options?.command ?? envOverride ?? (configured || platformDefault);
-      const commandSource = options?.command ?? envOverride ? "env" : configured ? "settings" : "default";
+      const command = options?.command || envOverride || configured || platformDefault;
+      const commandSource = options?.command || envOverride ? "env" : configured ? "settings" : "default";
       return createConnection(capabilities, {
         command,
         commandSource,
