@@ -52,6 +52,39 @@ describe("commandcode provider", () => {
     expect(buildArgs({}, "hello")).not.toContain("--yolo");
   });
 
+  it("ignores a whitespace-only COMMANDCODE_CLI_COMMAND", async () => {
+    const previous = process.env.COMMANDCODE_CLI_COMMAND;
+    process.env.COMMANDCODE_CLI_COMMAND = "   ";
+    const probed: string[] = [];
+    try {
+      const connection = await createCommandcodeProvider({
+        spawn: () => {
+          throw new Error("no spawn in probe test");
+        },
+        exec: (cmd) => {
+          probed.push(cmd);
+          return Promise.resolve({ stdout: "1.0.0", stderr: "" });
+        },
+        listModels: () => Promise.resolve("fallback-model  fallback (default)"),
+        listSkills: () => Promise.resolve(""),
+        log: () => {},
+      }).connect({ versions: [1], capabilities: ["prompt.message"] });
+      await connection.send({
+        type: "session.open",
+        requestId: "o1",
+        sessionId: "s1",
+        config: { cwd: "/tmp", env: {}, mcpServers: {}, settings: {}, persist: false },
+        history: "skip",
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    } finally {
+      if (previous === undefined) delete process.env.COMMANDCODE_CLI_COMMAND;
+      else process.env.COMMANDCODE_CLI_COMMAND = previous;
+    }
+    expect(probed.length).toBeGreaterThan(0);
+    expect(probed.every((cmd) => cmd === (process.platform === "win32" ? "cmdc" : "commandcode"))).toBe(true);
+  });
+
   it("runs a provider command as a CLI side effect", async () => {
     const connection = await createCommandcodeProvider({
       spawn: () => {
