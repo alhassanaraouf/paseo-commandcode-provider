@@ -1,1355 +1,224 @@
-import { execFile as nodeExecFile, spawn as nodeSpawn, type ExecFileOptions } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import {
-  negotiateProviderCapabilities,
-  requireProviderCapabilities,
-  type ProviderCapability,
-  type ProviderConfigState,
-  type ProviderConnection,
-  type ProviderContent,
-  type ProviderEvent,
-  type ProviderInput,
-  type ProviderPersistence,
-  type ProviderRegistration,
-  type ProviderSessionConfig,
-  type ProviderTimelineItem,
+import { runAcpProvider, type AcpTransformer } from "@getpaseo/plugin/server/acp";
+import type {
+  ProviderCommand,
+  ProviderConnection,
+  ProviderEvent,
+  ProviderInput,
+  ProviderRegistration,
 } from "@getpaseo/plugin/server/provider";
-import { buildArgs, parseLine, parseTaskGet, parseTaskId, parseTaskList, type RunFlags } from "./commandcode.js";
 import { commandArgv, COMMANDS, findCommand } from "./commands.js";
-import { ImageMaterializer } from "./images.js";
-import { parseListModels, type ModelInfo } from "./models.js";
-import { listNativeSessions, readNativeTranscript, toolDetail } from "./sessions.js";
-import { parseSkillsList, type SkillInfo } from "./skills.js";
 import { readSettingsDocument } from "./settings.js";
 import { CLI_DEFAULTS, cliSettings } from "../shared/settings.js";
 
-const CAPABILITIES = [
-  "prompt.message",
-  "prompt.command",
-  "prompt.image",
-  "session.configure",
-  "session.list",
-  "session.persistence",
-] as const;
-
-const SESSION_CAPABILITIES = [
-  "prompt.message",
-  "prompt.command",
-  "prompt.image",
-  "session.configure",
-  "session.list",
-  "session.persistence",
-] as const;
-
-// ponytail: effort levels are per-model (e.g. deepseek flash takes only high/max),
-// so no default is advertised and --effort is omitted unless explicitly chosen
-const EFFORTS = [
-  { id: "low", label: "Low" },
-  { id: "medium", label: "Medium" },
-  { id: "high", label: "High" },
-  { id: "max", label: "Max" },
-] as const;
-
-export interface ProcStdio {
-  on(event: "data", listener: (chunk: Buffer | string) => void): void;
-}
-
-export interface Proc {
-  stdout: ProcStdio | null;
-  stderr: ProcStdio | null;
-  // ponytail: untyped event bridge to Node ChildProcess, tighten if it grows
-  on(event: string, listener: (...args: never[]) => void): void;
-  kill(signal?: string): void;
-}
-
-export type SpawnFn = (
-  command: string,
-  args: string[],
-  options: { cwd: string; env: Record<string, string> },
-) => Proc;
-
-export interface ExecResult {
-  stdout: string;
-  stderr: string;
-}
+const execFileAsync = promisify(execFile);
 
 export type ExecFn = (
   command: string,
   args: string[],
-  options: { cwd: string; env: Record<string, string>; timeoutMs: number },
-) => Promise<ExecResult>;
-
-function defaultSpawn(
-  command: string,
-  args: string[],
   options: { cwd: string; env: Record<string, string> },
-): Proc {
-  const child = nodeSpawn(command, args, { cwd: options.cwd, env: options.env });
-  return {
-    stdout: child.stdout,
-    stderr: child.stderr,
-    on: child.on.bind(child) as Proc["on"],
-    kill: (signal) => {
-      child.kill(signal as NodeJS.Signals | undefined);
-    },
-  };
-}
+) => Promise<{ stdout: string; stderr: string }>;
 
-interface Session {
-  config: ProviderSessionConfig;
-  nativeSessionId: string | null;
-  transcript: ProviderTimelineItem[];
-  active: { turnId: string; proc: Proc; interrupted: boolean } | null;
-  tasks: Map<string, { text: string; status: "pending" | "in_progress" | "completed"; activeForm?: string }>;
-  /** First user text, used as the session title when the host didn't provide one. */
-  titleFromPrompt?: string;
-}
+type CommandSource = "env" | "settings" | "default";
 
-interface ModelsCache {
-  models: ModelInfo[];
-  defaultModel?: string;
-  fetchedAt: number;
-  /** Models known (via rejection probe) to accept no --effort flag. */
-  noEffortModels?: string[];
-}
-
-interface ConnectionState {
-  sessions: Map<string, Session>;
-  emit(event: ProviderEvent): void;
-  log(message: string): void;
-  command: string;
-  commandSource: "env" | "settings" | "default";
-  health: HealthState;
-  spawn: SpawnFn;
-  exec: ExecFn;
-  listModels: () => Promise<string>;
-  listSkills: () => Promise<string>;
-  models: ModelInfo[];
-  defaultModel?: string;
-  modelsFetchedAt: number;
-  cache: ModelsCache;
-  /** Models known (via rejection probe) to accept no --effort flag. */
-  noEffortModels: Set<string>;
-  skills: Map<string, SkillInfo>;
-  skillsFetchedAt: number;
-  images: ImageMaterializer;
-}
-
-interface HealthState {
-  checked: boolean;
-  ok: boolean;
-  version?: string;
-  error?: string;
-  checkedAt: number;
-}
-
-const HEALTH_TTL_MS = 5 * 60 * 1000;
-const MODELS_TTL_MS = 60 * 60 * 1000;
-const execFileAsync = promisify(nodeExecFile);
-
-async function runListModels(command: string): Promise<string> {
-  const { stdout } = await execFileAsync(command, ["--list-models"], { timeout: 30_000 });
-  return stdout;
-}
-
-async function runListSkills(command: string): Promise<string> {
-  const { stdout } = await execFileAsync(command, ["skills", "list"], { timeout: 30_000 });
-  return stdout;
-}
-
-function defaultExec(
-  command: string,
-  args: string[],
-  options: { cwd: string; env: Record<string, string>; timeoutMs: number },
-): Promise<ExecResult> {
-  return execFileAsync(command, args, {
+const defaultExec: ExecFn = (command, args, options) =>
+  execFileAsync(command, args, {
     cwd: options.cwd,
-    env: options.env,
-    timeout: options.timeoutMs,
+    env: { ...process.env, ...options.env },
+    timeout: 120_000,
     maxBuffer: 1024 * 1024,
-  } as ExecFileOptions).then(
+  }).then(
     ({ stdout, stderr }) => ({ stdout: String(stdout), stderr: String(stderr) }),
-    (error: unknown) => {
-      // ponytail: surface CLI stdout/stderr on failure instead of a bare exit code
-      const stdout = typeof (error as { stdout?: unknown }).stdout === "string" ? (error as { stdout: string }).stdout : "";
-      const stderr = typeof (error as { stderr?: unknown }).stderr === "string" ? (error as { stderr: string }).stderr : "";
-      const message = error instanceof Error ? error.message : String(error);
-      const detail = [stdout, stderr].map((part) => part.trim()).filter(Boolean).join("\n");
-      throw new Error(detail || message);
+    (error: { stdout?: unknown; stderr?: unknown; message?: string }) => {
+      // surface CLI stdout/stderr on failure instead of a bare exit code
+      const detail = [error.stdout, error.stderr]
+        .map((part) => (typeof part === "string" ? part.trim() : ""))
+        .filter(Boolean)
+        .join("\n");
+      throw new Error(detail || error.message || String(error));
     },
   );
+
+export function resolveCommand(override?: string): { command: string; source: CommandSource } {
+  const envOverride = override?.trim() || process.env.COMMANDCODE_CLI_COMMAND?.trim();
+  if (envOverride) return { command: envOverride, source: "env" };
+  const configured = readSettingsDocument(cliSettings, CLI_DEFAULTS).command.trim();
+  if (configured) return { command: configured, source: "settings" };
+  return { command: process.platform === "win32" ? "cmdc" : "commandcode", source: "default" };
 }
 
-export function createCommandcodeProvider(options?: {
-  command?: string;
-  spawn?: SpawnFn;
-  exec?: ExecFn;
-  listModels?: () => Promise<string>;
-  listSkills?: () => Promise<string>;
-  modelsCache?: ModelsCache;
-  /** Overridable for tests; defaults to a PASEO_HOME-backed materializer. */
-  images?: ImageMaterializer;
-  log?: (message: string) => void;
-}): ProviderRegistration {
+function binaryHint(command: string, source: CommandSource): string {
+  const from =
+    source === "env"
+      ? "from COMMANDCODE_CLI_COMMAND"
+      : source === "settings"
+        ? "from Settings → Plugins → Command Code"
+        : `by default on ${process.platform === "win32" ? "Windows (cmdc)" : "this platform (commandcode)"}`;
+  return `CLI binary "${command}" (resolved ${from}). Check it's on PATH and new enough to support \`${command} acp\`, or set it in Settings → Plugins → Command Code. Auth issues? Run \`${command} login\` in a terminal.`;
+}
+
+/**
+ * Agents created before the ACP switch persisted a "build" mode and a "yolo"
+ * setting. The CLI rejects both, and an unknown value would fail the whole
+ * session open, so drop them: such agents land in the CLI's default mode
+ * (Standard, which asks before changes). Stale effort/model values get the
+ * same treatment.
+ */
+export const legacyConfig: AcpTransformer = {
+  async configure(change, { config }) {
+    if (change.target === "mode") return change.value === "build" ? "handled" : "pass";
+    if (change.target === "setting") return change.id in (await config.read()) ? "pass" : "handled";
+    if (change.value === null) return "pass";
+    const id = change.target === "thinking" ? "effort" : "model";
+    // the print-mode provider offered "max"; the CLI's top level is "xhigh"
+    const value = change.target === "thinking" && change.value === "max" ? "xhigh" : change.value;
+    try {
+      await config.set(id, value);
+    } catch (error) {
+      console.error(`[commandcode-provider] ignoring ${id}=${String(value)}: ${error instanceof Error ? error.message : error}`);
+    }
+    return "handled";
+  },
+};
+
+/** The SDK's edit detail reads camelCase keys; Command Code tools use snake_case. */
+export const editInput: AcpTransformer = {
+  toolCall(snapshot) {
+    const input = snapshot.input;
+    if (snapshot.kind !== "edit" || typeof input !== "object" || input === null || Array.isArray(input)) return snapshot;
+    const mapped = { ...input };
+    const alias = (to: string, ...from: string[]) => {
+      const value = [to, ...from].map((key) => input[key]).find((candidate) => typeof candidate === "string");
+      if (value !== undefined) mapped[to] = value;
+    };
+    alias("filePath", "file_path", "path");
+    alias("oldString", "old_string");
+    alias("newString", "new_string", "content");
+    return { ...snapshot, input: mapped };
+  },
+};
+
+export function createCommandcodeProvider(options?: { command?: string; exec?: ExecFn }): ProviderRegistration {
   return {
     id: "commandcode",
     label: "Command Code",
-    description: "Command Code coding agent (headless via `commandcode -p`)",
+    description: "Command Code coding agent (over ACP via `commandcode acp`)",
     icon: "icon.svg",
     async connect(request) {
-      if (!request.versions.includes(1)) {
-        throw new Error("Provider protocol version 1 is required");
-      }
-      const capabilities = negotiateProviderCapabilities(
-        request.capabilities,
-        CAPABILITIES as unknown as readonly ProviderCapability[],
-      );
-      const platformDefault = process.platform === "win32" ? "cmdc" : "commandcode";
-      const configured = readSettingsDocument(cliSettings, CLI_DEFAULTS).command.trim();
-      const envOverride = process.env.COMMANDCODE_CLI_COMMAND?.trim();
-      const command = options?.command || envOverride || configured || platformDefault;
-      const commandSource = options?.command || envOverride ? "env" : configured ? "settings" : "default";
-      return createConnection(capabilities, {
-        command,
-        commandSource,
-        log: options?.log ?? ((message) => console.error(`[commandcode-provider] ${message}`)),
-        spawn: options?.spawn ?? defaultSpawn,
-        exec: options?.exec ?? defaultExec,
-        listModels: options?.listModels ?? (() => runListModels(command)),
-        listSkills: options?.listSkills ?? (() => runListSkills(command)),
-        cache: options?.modelsCache ?? createModelsCache(),
-        images: options?.images,
+      const { command, source } = resolveCommand(options?.command);
+      const acp = runAcpProvider({
+        id: "commandcode",
+        label: "Command Code",
+        command: [command, "acp"],
+        transformers: [legacyConfig, editInput],
+        acpOptions: { waitForInitialCommands: true },
       });
+      let inner: ProviderConnection;
+      try {
+        // The host only fills request.launch for registrations that declare a
+        // `command`; this one doesn't, so the binary resolved above is spawned.
+        inner = await acp.connect(request);
+      } catch (error) {
+        throw new Error(`${error instanceof Error ? error.message : String(error)}. ${binaryHint(command, source)}`);
+      }
+      return withCliCommands(inner, command, options?.exec ?? defaultExec);
     },
   };
 }
 
-function createConnection(
-  capabilities: readonly string[],
-  options: {
-    command: string;
-    commandSource: ConnectionState["commandSource"];
-    log: (message: string) => void;
-    spawn: SpawnFn;
-    exec: ExecFn;
-    listModels: () => Promise<string>;
-    listSkills: () => Promise<string>;
-    cache: ModelsCache;
-    /** Overridable for tests; defaults to a PASEO_HOME-backed materializer. */
-    images?: ImageMaterializer;
-  },
-): ProviderConnection {
+/**
+ * Adds the provider-side slash commands (headless `commandcode` subcommands
+ * like /status) on top of the commands the CLI advertises over ACP.
+ */
+export function withCliCommands(inner: ProviderConnection, command: string, exec: ExecFn): ProviderConnection {
+  const sessions = new Map<string, { cwd: string; env: Record<string, string> }>();
+  const busy = new Set<string>();
   const listeners = new Set<(event: ProviderEvent) => void>();
-  const sessions = new Map<string, Session>();
-  let closed = false;
-  const state: ConnectionState = {
-    sessions,
-    emit: (event) => {
-      if (closed) return;
-      for (const listener of listeners) listener(event);
-    },
-    log: options.log,
-    command: options.command,
-    commandSource: options.commandSource,
-    health: { checked: false, ok: false, checkedAt: 0 },
-    spawn: options.spawn,
-    exec: options.exec,
-    listModels: options.listModels,
-    listSkills: options.listSkills,
-    models: options.cache.models,
-    defaultModel: options.cache.defaultModel,
-    modelsFetchedAt: 0,
-    cache: options.cache,
-    // ponytail: ModelsCache is shared across connections, so the Set itself
-    // must be shared too — otherwise probes learned on one connection would
-    // be invisible on the next (each connection would emit stale options).
-    noEffortModels: new Set(options.cache.noEffortModels ?? []),
-    skills: new Map(),
-    skillsFetchedAt: 0,
-    images: options.images ?? new ImageMaterializer(),
+  const emit = (event: ProviderEvent) => {
+    for (const listener of listeners) listener(event);
+  };
+  const unsubscribe = inner.onEvent((event) => {
+    if (event.type === "session.turn") {
+      if (event.state === "started") busy.add(event.sessionId);
+      else busy.delete(event.sessionId);
+    }
+    emit(event.type === "session.commands" ? { ...event, commands: mergeCommands(event.commands) } : event);
+  });
+
+  const runCommand = (input: Extract<ProviderInput, { type: "session.prompt" }>, name: string, args: string) => {
+    const { sessionId } = input;
+    const { clientMessageId } = input.prompt;
+    const done = (error?: string) =>
+      emit({
+        type: "session.prompt_result",
+        sessionId,
+        clientMessageId,
+        result: error ? { type: "failed", error: { message: error } } : { type: "completed" },
+      });
+    const def = findCommand(name)!;
+    if (busy.has(sessionId) && !def.allowWhileRunning) return done(`/${name} needs the active turn to finish first`);
+    const argv = commandArgv(def, args);
+    if (!Array.isArray(argv)) return done(argv.error);
+    const session = sessions.get(sessionId);
+    void exec(command, argv, { cwd: session?.cwd ?? process.cwd(), env: session?.env ?? {} }).then(
+      ({ stdout, stderr }) => {
+        if (def.showOutput || def.notifyOnSuccess) {
+          const output = [stdout.trim(), stderr.trim()].filter(Boolean).join("\n");
+          emit({
+            type: "session.notice",
+            sessionId,
+            notice: {
+              id: `cmd-${clientMessageId}`,
+              severity: "info",
+              title: `/${name}`,
+              description: truncate(output || def.successMessage || "(no output)", 4000),
+            },
+          });
+        }
+        done();
+      },
+      (error: unknown) => done(`/${name} failed: ${error instanceof Error ? error.message : String(error)}`),
+    );
   };
 
   return {
-    version: 1,
-    capabilities,
-    async send(input: ProviderInput) {
-      if (closed) throw new Error("Provider connection is closed");
-      requireProviderCapabilities(capabilities, input);
-      if (input.type === "session.open" && sessions.has(input.sessionId)) {
-        throw new Error(`Session already exists: ${input.sessionId}`);
+    version: inner.version,
+    capabilities: inner.capabilities,
+    async send(input) {
+      if (input.type === "session.open") sessions.set(input.sessionId, { cwd: input.config.cwd, env: input.config.env });
+      if (input.type === "session.close") {
+        sessions.delete(input.sessionId);
+        busy.delete(input.sessionId);
       }
-      if ("sessionId" in input && input.type !== "session.open" && !sessions.has(input.sessionId)) {
-        throw new Error(`Unknown session: ${input.sessionId}`);
+      if (input.type === "session.prompt" && input.prompt.input.type === "command" && findCommand(input.prompt.input.name)) {
+        runCommand(input, input.prompt.input.name, input.prompt.input.arguments);
+        return;
       }
-      queueMicrotask(() => {
-        if (!closed) dispatch(input, state);
-      });
+      return inner.send(input);
     },
     onEvent(listener) {
       listeners.add(listener);
       return () => listeners.delete(listener);
     },
     async close() {
-      if (closed) return;
-      closed = true;
-      for (const session of sessions.values()) session.active?.proc.kill();
-      sessions.clear();
+      unsubscribe();
       listeners.clear();
-      state.images.clear();
+      await inner.close();
     },
   };
 }
 
-// ponytail: per-provider cache so every connection/open reuses the last good
-// list without re-running the ~4s CLI call; starts empty until refreshed
-function createModelsCache(): ModelsCache {
-  return { models: [], defaultModel: undefined, fetchedAt: 0 };
-}
-
-async function refreshModels(state: ConnectionState): Promise<boolean> {
-  if (Date.now() - state.cache.fetchedAt < MODELS_TTL_MS && state.cache.fetchedAt > 0) {
-    state.models = state.cache.models;
-    state.defaultModel = state.cache.defaultModel;
-    state.modelsFetchedAt = Date.now();
-    return false;
-  }
-  if (Date.now() - state.modelsFetchedAt < MODELS_TTL_MS) return false;
-  try {
-    const { models, defaultId } = parseListModels(await state.listModels());
-    if (models.length > 0) {
-      state.models = models;
-      state.cache.models = models;
-      if (defaultId) {
-        state.defaultModel = defaultId;
-        state.cache.defaultModel = defaultId;
-      }
-      state.modelsFetchedAt = Date.now();
-      state.cache.fetchedAt = Date.now();
-      return true;
-    }
-    state.log(`list-models returned no models (binary: ${state.command})`);
-  } catch (error) {
-    state.log(`list-models failed (${state.command}): ${error instanceof Error ? error.message : String(error)}`);
-  }
-  return false;
-}
-
-async function refreshSkills(state: ConnectionState): Promise<boolean> {
-  if (Date.now() - state.skillsFetchedAt < MODELS_TTL_MS && state.skillsFetchedAt > 0) return false;
-  try {
-    const parsed = parseSkillsList(await state.listSkills());
-    const next = new Map(parsed.map((skill) => [skill.name, skill] as const));
-    const changed =
-      next.size !== state.skills.size ||
-      [...next.keys()].some((name) => {
-        const prev = state.skills.get(name);
-        const cur = next.get(name);
-        return prev?.description !== cur?.description;
-      });
-    state.skills = next;
-    state.skillsFetchedAt = Date.now();
-    return changed;
-  } catch (error) {
-    state.log(`skills list failed (${state.command}): ${error instanceof Error ? error.message : String(error)}`);
-    return false;
-  }
-}
-
-// ponytail: shared Build/Plan catalog+config modes, keep identical in both places
-const MODES = [
-  { id: "build", label: "Build" },
-  { id: "plan", label: "Plan" },
-] as const;
-
-function binaryHint(state: ConnectionState): string {
-  const source =
-    state.commandSource === "env"
-      ? "from COMMANDCODE_CLI_COMMAND"
-      : state.commandSource === "settings"
-        ? "from Settings → Plugins → Command Code"
-        : `by default on ${process.platform === "win32" ? "Windows (cmdc)" : "this platform (commandcode)"}`;
-  return `CLI binary "${state.command}" (resolved ${source}). Check it's on PATH, or set it in Settings → Plugins → Command Code. Auth issues? Run \`${state.command} login\` or \`${state.command} status\` in a terminal.`;
-}
-
-async function checkHealth(state: ConnectionState, cwd: string): Promise<HealthState> {
-  if (state.health.checked && Date.now() - state.health.checkedAt < HEALTH_TTL_MS) return state.health;
-  try {
-    const env: Record<string, string> = {};
-    for (const [key, value] of Object.entries(process.env)) {
-      if (value !== undefined) env[key] = value;
-    }
-    const { stdout } = await state.exec(state.command, ["--version"], { cwd, env, timeoutMs: 15_000 });
-    const version = stdout.trim().split("\n")[0]?.trim();
-    state.health = { checked: true, ok: true, version: version || undefined, checkedAt: Date.now() };
-    state.log(`health ok: ${state.command}${version ? ` (${version})` : ""}`);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    state.health = { checked: true, ok: false, error: message, checkedAt: Date.now() };
-    state.log(`health failed (${state.command}): ${message}`);
-  }
-  return state.health;
-}
-
-function friendlySpawnError(error: unknown, state: ConnectionState): string {
-  const message = error instanceof Error ? error.message : String(error);
-  if (/ENOENT/i.test(message)) {
-    return `Couldn't start "${state.command}" (not found). ${binaryHint(state)}`;
-  }
-  return `${message}. ${binaryHint(state)}`;
-}
-
-function friendlyExitError(stderr: string, code: number | null, state: ConnectionState): string {
-  const detail = truncate(stderr.trim(), 500);
-  if (/not logged in|auth|login|unauthor/i.test(detail)) {
-    return `${detail || `commandcode exited with code ${code}`}. Run \`${state.command} login\` (or \`${state.command} status\`) in a terminal, then retry.`;
-  }
-  if (/unknown flag|invalid|effort/i.test(detail)) {
-    return `${detail}. The selected model may not support this effort level — try a different effort or leave it unset.`;
-  }
-  return `${detail || `commandcode exited with code ${code ?? "unknown"}`}. ${binaryHint(state)}`;
-}
-
-// ponytail: stale thinkingOptions survive model switches (the host keeps the
-// pill value per agent), and models with no adjustable effort (e.g. mimo
-// flash) reject --effort at startup — retry those turns without the flag
-function isEffortRejection(stderr: string): boolean {
-  if (/no adjustable reasoning effort/i.test(stderr)) return true;
-  return /effort/i.test(stderr) && /not support|unsupported|invalid|unknown flag/i.test(stderr);
-}
-
-export function makeTitle(configTitle: string | undefined, firstPrompt: string): string | undefined {
-  if (configTitle?.trim()) return configTitle;
-  const oneLine = firstPrompt.replace(/\s+/g, " ").trim();
-  return oneLine ? oneLine.slice(0, 80) : undefined;
-}
-
-type PersistedData = {
-  sessionId?: string;
-  tasks?: Array<{ id: string; text: string; status: "pending" | "in_progress" | "completed"; activeForm?: string }>;
-};
-
-function persistenceData(session: Session): { version: 1; data: PersistedData } {
-  const data: PersistedData = {};
-  if (session.nativeSessionId) data.sessionId = session.nativeSessionId;
-  if (session.tasks.size > 0) {
-    data.tasks = [...session.tasks.entries()].map(([id, task]) => ({
-      id,
-      text: task.text,
-      status: task.status,
-      ...(task.activeForm ? { activeForm: task.activeForm } : {}),
-    }));
-  }
-  return { version: 1, data };
-}
-
-function modelsView(models: ModelInfo[], noEffortModels?: Set<string>) {
-  return models.map((model) => ({
-    id: model.id,
-    label: model.label,
-    ...(model.description ? { description: model.description } : {}),
-    // ponytail: the CLI rejects --effort for some models (e.g. mimo flash) —
-    // per-model thinkingOptions lets the host hide the Thinking pill there
-    ...(noEffortModels?.has(model.id) ? { thinkingOptions: [] } : {}),
-  }));
-}
-
-function commandsView(state?: ConnectionState) {
-  const base = COMMANDS.map((command) => ({
+function mergeCommands(native: readonly ProviderCommand[]): ProviderCommand[] {
+  const names = new Set(native.map((command) => command.name));
+  const extra = COMMANDS.filter((command) => !names.has(command.name)).map((command) => ({
     name: command.name,
     description: command.description,
     ...(command.argumentHint ? { argumentHint: command.argumentHint } : {}),
   }));
-  if (!state) return base;
-  for (const skill of state.skills.values()) {
-    if (base.some((command) => command.name === skill.name)) continue;
-    base.push({
-      name: skill.name,
-      description: skill.description ?? `Invoke the ${skill.name} skill`,
-    });
-  }
-  return base;
+  return [...native, ...extra];
 }
 
-function catalogState(state: ConnectionState) {
-  return {
-    models: modelsView(state.models, state.noEffortModels),
-    modes: MODES.map((mode) => ({ ...mode })),
-    thinkingOptions: EFFORTS.map((effort) => ({
-      ...effort,
-      description: "Levels vary per model — leave unset if the CLI rejects your choice.",
-    })),
-    ...(state.defaultModel ? { defaultModel: state.defaultModel } : {}),
-    defaultMode: "build",
-  };
-}
-
-function dispatch(input: ProviderInput, state: ConnectionState): void {
-  switch (input.type) {
-    case "catalog":
-      void refreshModels(state).then(() => {
-        state.emit({ type: "catalog", requestId: input.requestId, catalog: catalogState(state) });
-      });
-      return;
-    case "sessions":
-      state.emit({
-        type: "sessions",
-        requestId: input.requestId,
-        sessions: listNativeSessions({ query: input.query, cwd: input.cwd, limit: input.limit }),
-      });
-      return;
-    case "session.open":
-      openSession(input, state);
-      return;
-    case "session.prompt":
-      promptSession(input, state);
-      return;
-    case "session.configure":
-      configureSession(input, state);
-      return;
-    case "session.interrupt": {
-      const session = state.sessions.get(input.sessionId);
-      if (session?.active) {
-        session.active.interrupted = true;
-        session.active.proc.kill();
-      }
-      state.emit({ type: "request.completed", requestId: input.requestId });
-      return;
-    }
-    case "session.close": {
-      const session = state.sessions.get(input.sessionId);
-      if (session?.active) {
-        session.active.interrupted = true;
-        session.active.proc.kill();
-      }
-      state.sessions.delete(input.sessionId);
-      state.emit({ type: "session.closed", sessionId: input.sessionId });
-      state.emit({ type: "request.completed", requestId: input.requestId });
-      return;
-    }
-    default:
-      return;
-  }
-}
-
-function resumeData(persistence: ProviderPersistence | undefined): PersistedData {
-  const data = persistence?.data;
-  if (typeof data !== "object" || data === null || Array.isArray(data)) return {};
-  const record = data as Record<string, unknown>;
-  const out: PersistedData = {};
-  if (typeof record.sessionId === "string") out.sessionId = record.sessionId;
-  if (Array.isArray(record.tasks)) {
-    const tasks: NonNullable<PersistedData["tasks"]> = [];
-    for (const entry of record.tasks) {
-      if (typeof entry !== "object" || entry === null) continue;
-      const task = entry as Record<string, unknown>;
-      if (typeof task.id !== "string" || typeof task.text !== "string") continue;
-      if (task.status !== "pending" && task.status !== "in_progress" && task.status !== "completed") continue;
-      tasks.push({
-        id: task.id,
-        text: task.text,
-        status: task.status,
-        ...(typeof task.activeForm === "string" ? { activeForm: task.activeForm } : {}),
-      });
-    }
-    if (tasks.length > 0) out.tasks = tasks;
-  }
-  return out;
-}
-
-function openSession(
-  input: Extract<ProviderInput, { type: "session.open" }>,
-  state: ConnectionState,
-): void {
-  const resumed = resumeData(input.persistence);
-  const session: Session = {
-    config: input.config,
-    nativeSessionId: resumed.sessionId ?? null,
-    transcript: [],
-    active: null,
-    tasks: new Map((resumed.tasks ?? []).map((task) => [task.id, { text: task.text, status: task.status, ...(task.activeForm ? { activeForm: task.activeForm } : {}) }])),
-  };
-  state.sessions.set(input.sessionId, session);
-  state.emit({
-    type: "session.opened",
-    requestId: input.requestId,
-    sessionId: input.sessionId,
-    capabilities: [...SESSION_CAPABILITIES],
-    restoration: "core",
-    ...(session.nativeSessionId || session.tasks.size > 0 ? { persistence: persistenceData(session) } : {}),
-    title: input.config.title,
-    cwd: input.config.cwd,
-  });
-  // ponytail: emit config+commands synchronously so the composer mounts complete;
-  // re-emit only when the background refresh actually changed the model list
-  state.emit({ type: "session.config", sessionId: input.sessionId, config: configState(session, state) });
-  state.emit({ type: "session.commands", sessionId: input.sessionId, commands: commandsView(state) });
-  void refreshModels(state).then((changed) => {
-    if (!changed) return;
-    state.emit({ type: "session.config", sessionId: input.sessionId, config: configState(session, state) });
-  });
-  void refreshSkills(state).then((changed) => {
-    if (!changed) return;
-    state.emit({ type: "session.commands", sessionId: input.sessionId, commands: commandsView(state) });
-  });
-  void checkHealth(state, session.config.cwd).then((health) => {
-    if (health.ok || !state.sessions.has(input.sessionId)) return;
-    state.emit({
-      type: "session.notice",
-      sessionId: input.sessionId,
-      notice: {
-        id: `health-${input.sessionId}`,
-        severity: "error",
-        title: `Couldn't reach the Command Code CLI`,
-        description: `${friendlySpawnError(health.error ?? "unknown error", state)}`,
-      },
-    });
-  });
-  if (input.history === "replay") {
-    if (session.nativeSessionId && session.transcript.length === 0) {
-      const replayed = readNativeTranscript(session.nativeSessionId);
-      session.transcript.push(...replayed.items);
-      for (const task of replayed.tasks) {
-        if (!session.tasks.has(task.id)) {
-          session.tasks.set(task.id, { text: task.text, status: task.status });
-        }
-      }
-    }
-    for (const item of session.transcript) {
-      state.emit({ type: "timeline.item", sessionId: input.sessionId, item });
-    }
-  }
-  state.emit({ type: "session.ready", requestId: input.requestId, sessionId: input.sessionId });
-}
-
-function settingValue(
-  settings: Readonly<Record<string, unknown>>,
-  id: string,
-): string | boolean | undefined {
-  const value = settings[id];
-  return typeof value === "string" || typeof value === "boolean" ? value : undefined;
-}
-
-function isYolo(settings: Readonly<Record<string, unknown>>): boolean {
-  // ponytail: legacy autoAccept values (bool or on/off) map to yolo;
-  // --auto-accept never unlocked headless writes, --yolo does
-  const value = settings.yolo ?? settings.autoAccept;
-  return value === true || value === "on";
-}
-
-// ponytail: lets a user point at a custom binary (path, cmdc, a wrapper
-// script) via the agent's standard env vars, no dedicated settings UI needed
-function commandFor(session: Session, state: ConnectionState): string {
-  return session.config.env.COMMANDCODE_CLI_COMMAND?.trim() || state.command;
-}
-
-function effortOf(session: Session, state?: ConnectionState): string | undefined {
-  // ponytail: effort lives only in the native Thinking pill (thinkingOptions);
-  // the custom select was a duplicate, so settings are ignored here
-  const raw = session.config.thinkingOption;
-  if (typeof raw !== "string" || !EFFORTS.some((effort) => effort.id === raw)) return undefined;
-  // ponytail: models probed as effortless (e.g. mimo flash) reject --effort —
-  // never send the flag for them, even if the host kept a stale pill value
-  if (state && session.config.model && state.noEffortModels.has(session.config.model)) return undefined;
-  return raw;
-}
-
-function configState(session: Session, state?: ConnectionState): ProviderConfigState {
-  const settings = session.config.settings as Record<string, unknown>;
-  const effort = effortOf(session, state);
-  const models = state?.models ?? [];
-  const defaultModel = state?.defaultModel ?? session.config.model;
-  return {
-    ...(session.config.model ?? defaultModel ? { model: session.config.model ?? defaultModel } : {}),
-    mode: session.config.mode ?? "build",
-    thinkingOption: effort,
-    models: modelsView(models, state?.noEffortModels),
-    modes: MODES.map((mode) => ({ ...mode })),
-    thinkingOptions: EFFORTS.map((option) => ({
-      ...option,
-      description: "Levels vary per model — leave unset if the CLI rejects your choice.",
-    })),
-    // ponytail: single permission knob as a select so state shows beside
-    // the label. --auto-accept can't unlock headless writes, so this drives
-    // --yolo --tools-all, labeled honestly.
-    settings: [
-      {
-        type: "select",
-        id: "yolo",
-        label: "Full auto (yolo, skips all permission checks)",
-        value: isYolo(settings) ? "on" : "off",
-        options: [
-          { label: "On", value: "on" },
-          { label: "Off", value: "off" },
-        ],
-      },
-    ],
-  };
-}
-
-function refreshAllSessionsConfig(state: ConnectionState): void {
-  for (const [id, session] of state.sessions) {
-    state.emit({ type: "session.config", sessionId: id, config: configState(session, state) });
-  }
-}
-
-function configureSession(
-  input: Extract<ProviderInput, { type: "session.configure" }>,
-  state: ConnectionState,
-): void {
-  const session = state.sessions.get(input.sessionId);
-  if (!session) {
-    state.emit({
-      type: "request.failed",
-      requestId: input.requestId,
-      error: { message: `Unknown session: ${input.sessionId}` },
-    });
-    return;
-  }
-  const changes = input.changes;
-  session.config = {
-    ...session.config,
-    model: changes.model === null ? undefined : (changes.model ?? session.config.model),
-    mode: changes.mode === null ? undefined : (changes.mode ?? session.config.mode),
-    thinkingOption:
-      changes.thinkingOption === null
-        ? undefined
-        : (changes.thinkingOption ?? session.config.thinkingOption),
-    settings: changes.settings
-      ? { ...session.config.settings, ...changes.settings }
-      : session.config.settings,
-  };
-  // ponytail: switching to a model probed as effortless — the host keeps the
-  // per-agent pill value, so drop it here (unless the user explicitly picked
-  // an effort in the same change) instead of failing the first turn
-  if (
-    changes.thinkingOption === undefined &&
-    changes.model !== undefined &&
-    changes.model !== null &&
-    state.noEffortModels.has(changes.model)
-  ) {
-    session.config = { ...session.config, thinkingOption: undefined };
-  }
-  // ponytail: user explicitly set an effort on a model we previously marked
-  // effortless — forget the mark so the flag is sent (and re-probed) again
-  if (
-    changes.thinkingOption !== undefined &&
-    changes.thinkingOption !== null &&
-    session.config.model &&
-    state.noEffortModels.delete(session.config.model)
-  ) {
-    state.cache.noEffortModels = [...state.noEffortModels];
-  }
-  state.emit({ type: "session.config", sessionId: input.sessionId, config: configState(session, state) });
-  state.emit({
-    type: "session.commands",
-    sessionId: input.sessionId,
-    commands: commandsView(state),
-  });
-  state.emit({ type: "request.completed", requestId: input.requestId });
-}
-
-function promptText(
-  content: ProviderContent[],
-  images: ImageMaterializer,
-): { text: string; unsupported: string[]; attachments: string[] } {
-  let text = "";
-  const unsupported = new Set<string>();
-  const attachments: string[] = [];
-  for (const part of content) {
-    if (part.type === "text") text += (text ? "\n" : "") + part.text;
-    else if (part.type === "image") {
-      // read_file attaches an image by absolute path, so the model still sees it
-      try {
-        const file = images.materialize(part);
-        attachments.push(file);
-        text += (text ? "\n" : "") + `[Image available at: ${file}]`;
-      } catch (error) {
-        unsupported.add(
-          `Image not forwarded (${error instanceof Error ? error.message : String(error)})`,
-        );
-      }
-    } else if (part.type === "uploaded_file") {
-      text += (text ? "\n" : "") + `[Attached file: ${part.fileName} (${part.path})]`;
-      unsupported.add("File contents aren't forwarded — reference the file by path instead");
-    } else {
-      unsupported.add(`Attachments of type "${part.type}" are not forwarded`);
-    }
-  }
-  return { text, unsupported: [...unsupported], attachments };
-}
-
-function flagsFor(session: Session, state?: ConnectionState): RunFlags {
-  const settings = session.config.settings as Record<string, unknown>;
-  const effort = effortOf(session, state);
-  return {
-    model: session.config.model ?? undefined,
-    effort,
-    plan: session.config.mode === "plan",
-    yolo: isYolo(settings),
-    resumeSessionId: session.nativeSessionId ?? undefined,
-  };
-}
-
-function promptSession(
-  input: Extract<ProviderInput, { type: "session.prompt" }>,
-  state: ConnectionState,
-): void {
-  const session = state.sessions.get(input.sessionId);
-  const fail = (message: string) => {
-    state.emit({
-      type: "session.prompt_result",
-      sessionId: input.sessionId,
-      clientMessageId: input.prompt.clientMessageId,
-      result: { type: "failed", error: { message } },
-    });
-  };
-  if (!session) {
-    fail(`Unknown session: ${input.sessionId}`);
-    return;
-  }
-  if (input.prompt.delivery === "steer") {
-    fail("Steering is not supported; wait for the turn to finish");
-    return;
-  }
-  if (input.prompt.input.type === "command") {
-    runSlashCommand(input.sessionId, session, input.prompt.clientMessageId, input.prompt.input.name, input.prompt.input.arguments, state);
-    return;
-  }
-  const { text, unsupported, attachments } = promptText(input.prompt.input.content, state.images);
-  if (!text.trim()) {
-    fail(["Empty prompt", ...unsupported].join(". "));
-    return;
-  }
-  if (unsupported.length > 0) {
-    const session = state.sessions.get(input.sessionId);
-    if (session) {
-      session.transcript.push({
-        type: "notification",
-        id: `warn-${input.prompt.clientMessageId}`,
-        level: "warning",
-        message: unsupported.join(". "),
-      });
-      state.emit({
-        type: "timeline.item",
-        sessionId: input.sessionId,
-        item: session.transcript[session.transcript.length - 1],
-      });
-    }
-  }
-  // Materialized images live in a temp root the CLI auto-allows reads from, so
-  // they are scoped to this turn rather than to the connection: macOS reaps
-  // /tmp after ~3 days, and a per-turn lifetime makes that unreachable.
-  runAgentTurn(input.sessionId, session, input.prompt.clientMessageId, text, state, attachments);
-}
-
-function runSlashCommand(
-  sessionId: string,
-  session: Session,
-  clientMessageId: string,
-  name: string,
-  args: string,
-  state: ConnectionState,
-): void {
-  if (findCommand(name)) {
-    runCommand(sessionId, session, clientMessageId, name, args, state);
-    return;
-  }
-  if (state.skills.has(name)) {
-    // ponytail: installed skills are first-class slash commands in the CLI,
-    // so run them as an agent turn: `commandcode -p "/skill args"`.
-    const text = args.trim() ? `/${name} ${args.trim()}` : `/${name}`;
-    runAgentTurn(sessionId, session, clientMessageId, text, state);
-    return;
-  }
-  // ponytail: skills load in the background at session.open, so a fast
-  // typist can beat the refresh — retry once before reporting unknown.
-  void refreshSkills(state).then((changed) => {
-    if (changed) {
-      state.emit({ type: "session.commands", sessionId, commands: commandsView(state) });
-    }
-    if (state.skills.has(name)) {
-      const text = args.trim() ? `/${name} ${args.trim()}` : `/${name}`;
-      runAgentTurn(sessionId, session, clientMessageId, text, state);
-      return;
-    }
-    state.emit({
-      type: "session.prompt_result",
-      sessionId,
-      clientMessageId,
-      result: { type: "failed", error: { message: `Unknown command: /${name}` } },
-    });
-  });
-}
-
-function runAgentTurn(
-  sessionId: string,
-  session: Session,
-  clientMessageId: string,
-  text: string,
-  state: ConnectionState,
-  /** Image files this turn materialized, released once the turn ends. */
-  attachments: string[] = [],
-): void {
-  const fail = (message: string) => {
-    state.emit({
-      type: "session.prompt_result",
-      sessionId,
-      clientMessageId,
-      result: { type: "failed", error: { message } },
-    });
-  };
-  if (session.active) {
-    fail("A turn is already running");
-    state.images.release(attachments);
-    return;
-  }
-
-  const turnId = randomUUID();
-  const push = (item: ProviderTimelineItem) => {
-    session.transcript.push(item);
-    state.emit({ type: "timeline.item", sessionId, item });
-  };
-  // ponytail: the Tasks pill renders timeline todo items, same as opencode's
-  // provider — task_* tool calls maintain a session task list emitted here
-  const emitTasks = () => {
-    if (session.tasks.size === 0) return;
-    push({
-      type: "todo",
-      id: "tasks",
-      items: [...session.tasks.entries()].map(([id, task]) => ({
-        id,
-        text: task.text,
-        completed: task.status === "completed",
-        status: task.status,
-        ...(task.activeForm ? { activeForm: task.activeForm } : {}),
-      })),
-    });
-  };
-  const taskStatusOf = (value: unknown): "pending" | "in_progress" | "completed" | "deleted" | undefined =>
-    value === "pending" || value === "in_progress" || value === "completed" || value === "deleted"
-      ? value
-      : undefined;
-  if (!session.titleFromPrompt && !text.startsWith("/")) {
-    const title = makeTitle(session.config.title, text);
-    if (title && title !== session.config.title) {
-      session.titleFromPrompt = title;
-      state.emit({
-        type: "session.opened",
-        sessionId,
-capabilities: [...SESSION_CAPABILITIES],
-        restoration: "core",
-        persistence: persistenceData(session),
-        title: session.titleFromPrompt || undefined,
-        cwd: session.config.cwd,
-      });
-    }
-  }
-  push({
-    type: "user_message",
-    id: `user-${turnId}`,
-    text,
-    clientMessageId,
-  });
-  state.emit({
-    type: "session.prompt_result",
-    sessionId,
-    clientMessageId,
-    result: { type: "turn", turnId },
-  });
-  state.emit({ type: "session.turn", sessionId, turnId, state: "started" });
-
-  const env: Record<string, string> = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (value !== undefined) env[key] = value;
-  }
-  Object.assign(env, session.config.env);
-  const baseFlags = flagsFor(session, state);
-  let attemptEffort = baseFlags.effort;
-  let retriedWithoutEffort = false;
-  const spawnArgs = () => buildArgs({ ...baseFlags, effort: attemptEffort }, text);
-  let proc: Proc;
-  try {
-    proc = state.spawn(commandFor(session, state), spawnArgs(), {
-      cwd: session.config.cwd,
-      env,
-    });
-  } catch (error) {
-    state.log(`spawn failed (${commandFor(session, state)}): ${error instanceof Error ? error.message : String(error)}`);
-    state.emit({
-      type: "session.turn",
-      sessionId,
-      turnId,
-      state: "failed",
-      error: { message: friendlySpawnError(error, state) },
-    });
-    state.images.release(attachments);
-    return;
-  }
-  session.active = { turnId, proc, interrupted: false };
-
-  let assistantText = "";
-  let thinkingText = "";
-  let usage: { inputTokens?: number; outputTokens?: number } | undefined;
-  let stderr = "";
-  let finished = false;
-  const tools = new Map<
-    string,
-    { name: string; input: Record<string, unknown>; resultText?: string; status: "running" }
-  >();
-  let pendingAssistant = false;
-  let pendingReasoning = false;
-  let reasoningBlock = 0;
-  // The implicit block (thinking deltas before any thinking_start) owns id 0,
-  // so the first explicit block pre-increments to keep every id unique.
-  let reasoningId = `reasoning-${turnId}-${reasoningBlock}`;
-  // Paseo turns repeated provider snapshots into separate timeline deltas:
-  // mapTimelineItem slices off the text it already saw for the same id. So a
-  // cumulative buffer is safe to re-emit, and must be — flushing text only at
-  // the end of the run moves every paragraph after the tool calls it preceded,
-  // which reads as one solid list of tools followed by one summary.
-  // Thinking keeps a per-block id and flushes at thinking_end.
-  const flushReasoning = () => {
-    if (!pendingReasoning) return;
-    pendingReasoning = false;
-    if (thinkingText) push({ type: "reasoning", id: reasoningId, text: thinkingText });
-  };
-  const flushAssistant = () => {
-    if (!pendingAssistant) return;
-    pendingAssistant = false;
-    // The buffer must be sent cumulatively: mapTimelineItem slices off whatever
-    // prefix it already holds for this id. Sending only the new part breaks it
-    // whenever a fresh delta happens to start with the previous one ("ok" then
-    // "okay"), which the host reads as a repeat and drops.
-    if (assistantText) push({ type: "assistant_message", id: `assistant-${turnId}`, text: assistantText });
-  };
-  // Text that arrived before a tool call belongs above that call, so flush the
-  // pending buffers first — otherwise the paragraph lands after the result it
-  // was reacting to.
-  const flushBeforeTool = () => {
-    flushReasoning();
-    flushAssistant();
-  };
-  const finish = (terminal: "completed" | "failed" | "canceled", error?: string) => {
-    if (finished) return;
-    finished = true;
-    flushReasoning();
-    flushAssistant();
-    // The turn that could read these files is over, so they go now rather than
-    // lingering in /tmp until the connection closes.
-    state.images.release(attachments);
-    session.active = null;
-    state.emit({
-      type: "session.persistence",
-      sessionId,
-      persistence: persistenceData(session),
-    });
-    state.emit({ type: "session.turn", sessionId, turnId, state: terminal, ...(error ? { error: { message: error } } : {}) });
-  };
-
-  let buffer = "";
-  const onChunk = (chunk: Buffer | string) => {
-    buffer += chunk.toString();
-    const lines = buffer.split("\n");
-    buffer = lines.pop() ?? "";
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      const parsed = parseLine(line);
-      switch (parsed.kind) {
-        case "run_start":
-          session.nativeSessionId = parsed.sessionId;
-          state.emit({
-            type: "session.persistence",
-            sessionId,
-            persistence: persistenceData(session),
-          });
-          break;
-        case "thinking_start":
-          if (pendingReasoning) flushReasoning();
-          reasoningId = `reasoning-${turnId}-${++reasoningBlock}`;
-          thinkingText = "";
-          break;
-        case "thinking_delta":
-          thinkingText += parsed.delta;
-          pendingReasoning = true;
-          break;
-        case "thinking_end":
-          thinkingText = parsed.text;
-          pendingReasoning = true;
-          flushReasoning();
-          break;
-        case "text_delta":
-          assistantText += parsed.delta;
-          pendingAssistant = true;
-          break;
-        case "message_update":
-          // This is a cumulative state snapshot of content already delivered
-          // through the delta events, not another visible timeline item.
-          break;
-        case "tool_queued":
-        case "tool_running": {
-          flushBeforeTool();
-          const existing = tools.get(parsed.toolCallId) ?? {
-            name: parsed.toolName,
-            input: parsed.kind === "tool_queued" ? parsed.input : {},
-            status: "running" as const,
-          };
-          tools.set(parsed.toolCallId, existing);
-          push({
-            type: "tool_call",
-            id: parsed.toolCallId,
-            callId: parsed.toolCallId,
-            name: existing.name,
-            detail: toolDetail(existing.name, existing.input),
-            status: "running",
-            error: null,
-          });
-          // ponytail: optimistic pill update so status flips show immediately
-          if (parsed.kind === "tool_queued" && parsed.toolName === "task_update") {
-            const id = String(parsed.input.taskId ?? "");
-            const task = id ? session.tasks.get(id) : undefined;
-            const status = taskStatusOf(parsed.input.status);
-            const subject = typeof parsed.input.subject === "string" ? parsed.input.subject : undefined;
-            if (id && (task || subject)) {
-              if (status === "deleted") session.tasks.delete(id);
-              else {
-                session.tasks.set(id, {
-                  text: subject ?? task?.text ?? id,
-                  status: status ?? task?.status ?? "pending",
-                  activeForm:
-                    typeof parsed.input.activeForm === "string"
-                      ? parsed.input.activeForm
-                      : task?.activeForm,
-                });
-              }
-              emitTasks();
-            }
-          }
-          break;
-        }
-        case "tool_completed": {
-          const existing = tools.get(parsed.toolCallId) ?? {
-            name: parsed.toolName,
-            input: {},
-            status: "running" as const,
-          };
-          tools.set(parsed.toolCallId, { ...existing, resultText: parsed.resultText });
-          push({
-            type: "tool_call",
-            id: parsed.toolCallId,
-            callId: parsed.toolCallId,
-            name: existing.name,
-            detail: toolDetail(existing.name, existing.input, truncate(parsed.resultText)),
-            status: "completed",
-            error: null,
-          });
-          if (existing.name === "task_list") {
-            const items = parseTaskList(parsed.resultText);
-            if (items.length > 0) {
-              session.tasks = new Map(
-                items.map((item) => [item.id, { text: item.text, status: item.status }]),
-              );
-              emitTasks();
-            }
-          } else if (existing.name === "task_get") {
-            const item = parseTaskGet(parsed.resultText);
-            if (item) {
-              const prev = session.tasks.get(item.id);
-              session.tasks.set(item.id, { text: item.text, status: item.status, activeForm: prev?.activeForm });
-              emitTasks();
-            }
-          } else if (existing.name === "task_create" || existing.name === "task_update") {
-            const input = existing.input as Record<string, unknown>;
-            const id = String(input.taskId ?? parseTaskId(parsed.resultText) ?? "");
-            const status = taskStatusOf(input.status);
-            const subject = (input.subject ?? input.description) as unknown;
-            const title =
-              typeof subject === "string" && subject
-                ? subject
-                : /^Task #\S+ created:\s*(.+?)\s*$/.exec(parsed.resultText)?.[1];
-            if (existing.name === "task_create" && id) {
-              session.tasks.set(id, {
-                text: title || `Task ${id}`,
-                status: status && status !== "deleted" ? status : "pending",
-                ...(typeof input.activeForm === "string" ? { activeForm: input.activeForm } : {}),
-              });
-              emitTasks();
-            } else if (existing.name === "task_update" && id) {
-              if (status === "deleted") {
-                if (session.tasks.delete(id)) emitTasks();
-              } else {
-                const prev = session.tasks.get(id);
-                if (prev || title || status) {
-                  session.tasks.set(id, {
-                    text: title ?? prev?.text ?? `Task ${id}`,
-                    status: status ?? prev?.status ?? "pending",
-                    activeForm:
-                      typeof input.activeForm === "string" ? input.activeForm : prev?.activeForm,
-                  });
-                  emitTasks();
-                }
-              }
-            }
-          }
-          break;
-        }
-        case "turn_end":
-          usage = parsed.usage;
-          break;
-        case "run_end": {
-          if (parsed.sessionId) {
-            session.nativeSessionId = parsed.sessionId;
-            state.emit({
-              type: "session.persistence",
-              sessionId,
-              persistence: persistenceData(session),
-            });
-          }
-          if (!assistantText && parsed.finalText) {
-            assistantText = parsed.finalText;
-            pendingAssistant = true;
-          }
-          if (usage && (usage.inputTokens !== undefined || usage.outputTokens !== undefined)) {
-            state.emit({ type: "session.usage", sessionId, turnId, usage });
-          }
-          finish("completed");
-          break;
-        }
-        case "ignored":
-          break;
-      }
-    }
-  };
-
-  const wireProc = (target: Proc) => {
-    target.stdout?.on("data", onChunk);
-    target.stderr?.on("data", (chunk) => {
-      stderr += chunk.toString();
-    });
-    target.on("error", (error: unknown) => {
-      const message = error instanceof Error ? error.message : String(error);
-      state.log(`turn ${turnId} proc error: ${message}`);
-      const interrupted = session.active?.interrupted;
-      push({ type: "error", id: `error-${turnId}`, message: friendlySpawnError(message, state) });
-      finish(interrupted ? "canceled" : "failed", friendlySpawnError(message, state));
-    });
-    target.on("close", (code) => {
-      if (finished) return;
-      const interrupted = session.active?.interrupted;
-      if (interrupted) {
-        if (buffer.trim()) onChunk("\n");
-        finish("canceled");
-        return;
-      }
-      if (buffer.trim()) onChunk("\n");
-      if (typeof code === "number" && code !== 0) {
-        // ponytail: --effort came from a stale per-agent Thinking value or a
-        // model with no adjustable effort — one retry without the flag, same turn
-        if (attemptEffort && !retriedWithoutEffort && isEffortRejection(stderr)) {
-          retriedWithoutEffort = true;
-          attemptEffort = undefined;
-          // ponytail: drop the stale pill value so later turns skip --effort too
-          session.config = { ...session.config, thinkingOption: undefined };
-          // ponytail: remember the model as effortless — the pill is hidden
-          // for it from here on (per-model thinkingOptions) and --effort is
-          // never sent again, even across reconnects
-          if (session.config.model) {
-            state.noEffortModels.add(session.config.model);
-            state.cache.noEffortModels = [...state.noEffortModels];
-          }
-          refreshAllSessionsConfig(state);
-          state.log(`turn ${turnId} retrying without --effort (${truncate(stderr.trim(), 200)})`);
-          buffer = "";
-          stderr = "";
-          let retry: Proc;
-          try {
-            retry = state.spawn(commandFor(session, state), spawnArgs(), {
-              cwd: session.config.cwd,
-              env,
-            });
-          } catch (error) {
-            const message = friendlySpawnError(error instanceof Error ? error.message : String(error), state);
-            state.log(`turn ${turnId} retry spawn failed: ${message}`);
-            finish("failed", message);
-            return;
-          }
-          session.active = { turnId, proc: retry, interrupted: false };
-          proc = retry;
-          wireProc(retry);
-          return;
-        }
-        const message = friendlyExitError(stderr, code, state);
-        state.log(`turn ${turnId} exited ${code}: ${truncate(stderr.trim(), 200) || "no stderr"}`);
-        finish("failed", message);
-      } else if (code === null || code === undefined) {
-        finish("canceled");
-      } else {
-        finish(assistantText ? "completed" : "failed", assistantText ? undefined : `No response from the CLI. ${binaryHint(state)}`);
-      }
-    });
-  };
-
-  wireProc(proc);
-}
-
-function runCommand(
-  sessionId: string,
-  session: Session,
-  clientMessageId: string,
-  name: string,
-  args: string,
-  state: ConnectionState,
-): void {
-  const done = (result: { type: "completed" } | { type: "failed"; error: { message: string } }) => {
-    state.emit({ type: "session.prompt_result", sessionId, clientMessageId, result });
-  };
-  const def = findCommand(name);
-  if (!def) {
-    done({ type: "failed", error: { message: `Unknown command: /${name}` } });
-    return;
-  }
-  if (session.active && !def.allowWhileRunning) {
-    done({ type: "failed", error: { message: `/${name} needs the active turn to finish first` } });
-    return;
-  }
-  const argv = commandArgv(def, args);
-  if (!Array.isArray(argv)) {
-    done({ type: "failed", error: { message: argv.error } });
-    return;
-  }
-  const env: Record<string, string> = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (value !== undefined) env[key] = value;
-  }
-  Object.assign(env, session.config.env);
-  void state
-    .exec(commandFor(session, state), argv, { cwd: session.config.cwd, env, timeoutMs: 120_000 })
-    .then(({ stdout, stderr }) => {
-      const output = [stdout.trim(), stderr.trim()].filter(Boolean).join("\n");
-      if (def.showOutput || def.notifyOnSuccess) {
-        state.emit({
-          type: "session.notice",
-          sessionId,
-          notice: {
-            id: `cmd-${clientMessageId}`,
-            severity: "info",
-            title: `/${name}`,
-            description: truncate(output || def.successMessage || "(no output)", 4000),
-          },
-        });
-      }
-      done({ type: "completed" });
-    })
-    .catch((error: unknown) => {
-      const message = error instanceof Error ? error.message : String(error);
-      state.log(`/${name} failed: ${message}`);
-      done({
-        type: "failed",
-        error: { message: `/${name} failed: ${friendlySpawnError(message, state)}` },
-      });
-    });
-}
-
-function truncate(text: string, max = 8000): string {
+function truncate(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max)}\n…(truncated)` : text;
 }

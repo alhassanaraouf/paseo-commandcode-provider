@@ -1,7 +1,7 @@
 {
   "name": "@alhassanaraouf/paseo-commandcode-provider",
-  "version": "0.1.4",
-  "description": "Paseo provider for the Command Code coding agent (headless via `commandcode -p`)",
+  "version": "0.2.0",
+  "description": "Paseo provider for the Command Code coding agent (over ACP via `commandcode acp`)",
   "author": "Al-Hassan Abdel-Raouf",
   "license": "MIT",
   "scripts": {
