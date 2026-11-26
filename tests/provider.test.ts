@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { AcpConfigAccess } from "@getpaseo/plugin/server/acp";
 import type { ProviderConnection, ProviderEvent, ProviderInput } from "@getpaseo/plugin/server/provider";
 import { editInput, legacyConfig, withCliCommands, type ExecFn } from "../server/provider.js";
@@ -109,5 +109,28 @@ describe("withCliCommands", () => {
     fire({ type: "session.turn", sessionId: "s", turnId: "t", state: "started" });
     await conn.send(command("skills-add", "a/b"));
     expect(events.at(-1)).toMatchObject({ type: "session.prompt_result", result: { type: "failed" } });
+  });
+});
+
+describe("session.open timing", () => {
+  it("logs load and total time once the session is ready", async () => {
+    const { inner, fire } = fakeInner();
+    const conn = withCliCommands(inner, "cmd", async () => ({ stdout: "", stderr: "" }));
+    const logs: string[] = [];
+    const spy = vi.spyOn(console, "error").mockImplementation((msg) => void logs.push(String(msg)));
+    await conn.send({
+      type: "session.open",
+      requestId: "r1",
+      sessionId: "s",
+      config: { cwd: "/tmp", env: {} },
+      persistence: { nativeSessionId: "n" },
+      history: "replay",
+    } as unknown as ProviderInput);
+    fire({ type: "session.opened", requestId: "r1", sessionId: "s", capabilities: [], restoration: "core", cwd: "/tmp" });
+    fire({ type: "session.ready", requestId: "r1", sessionId: "s" });
+    fire({ type: "session.ready", requestId: "r1", sessionId: "s" });
+    spy.mockRestore();
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toMatch(/session\.open ready session=s resumed=true load=\d+ms total=\d+ms/);
   });
 });
