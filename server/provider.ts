@@ -135,10 +135,27 @@ export function withCliCommands(inner: ProviderConnection, command: string, exec
   const sessions = new Map<string, { cwd: string; env: Record<string, string> }>();
   const busy = new Set<string>();
   const listeners = new Set<(event: ProviderEvent) => void>();
+  // session.open timings by requestId, logged to `paseo plugin logs` (issue #21)
+  const opens = new Map<string, { sessionId: string; resumed: boolean; start: number; loaded?: number }>();
+  const logOpen = (requestId: string, outcome: string) => {
+    const open = opens.get(requestId);
+    if (!open) return;
+    opens.delete(requestId);
+    const loaded = open.loaded === undefined ? "" : ` load=${open.loaded - open.start}ms`;
+    console.error(
+      `[commandcode-provider] session.open ${outcome} session=${open.sessionId} resumed=${open.resumed}${loaded} total=${Date.now() - open.start}ms`,
+    );
+  };
   const emit = (event: ProviderEvent) => {
     for (const listener of listeners) listener(event);
   };
   const unsubscribe = inner.onEvent((event) => {
+    if (event.type === "session.opened" && event.requestId) {
+      const open = opens.get(event.requestId);
+      if (open) open.loaded = Date.now();
+    }
+    if (event.type === "session.ready" && event.requestId) logOpen(event.requestId, "ready");
+    if (event.type === "request.failed") logOpen(event.requestId, `failed (${event.error.message})`);
     if (event.type === "session.turn") {
       if (event.state === "started") busy.add(event.sessionId);
       else busy.delete(event.sessionId);
@@ -186,7 +203,10 @@ export function withCliCommands(inner: ProviderConnection, command: string, exec
     version: inner.version,
     capabilities: inner.capabilities,
     async send(input) {
-      if (input.type === "session.open") sessions.set(input.sessionId, { cwd: input.config.cwd, env: input.config.env });
+      if (input.type === "session.open") {
+        sessions.set(input.sessionId, { cwd: input.config.cwd, env: input.config.env });
+        opens.set(input.requestId, { sessionId: input.sessionId, resumed: Boolean(input.persistence), start: Date.now() });
+      }
       if (input.type === "session.close") {
         sessions.delete(input.sessionId);
         busy.delete(input.sessionId);
